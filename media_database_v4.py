@@ -487,14 +487,29 @@ def ingest_dir(conn, directory, recursive=True, force=False, mirror=False,
 # ─────────────────────────────────────────────────────────────────────────────
 # SEARCH
 # ─────────────────────────────────────────────────────────────────────────────
+def folder_descendant_ids(conn, folder_id):
+    """Return folder_id plus every folder nested under it (any depth), so a
+    folder selection can include media filed in its subfolders too."""
+    ids = {folder_id}
+    frontier = [folder_id]
+    while frontier:
+        parent = frontier.pop()
+        for row in conn.execute("SELECT id FROM folders WHERE parent_id=?", (parent,)):
+            if row["id"] not in ids:
+                ids.add(row["id"])
+                frontier.append(row["id"])
+    return list(ids)
+
 def search(conn, query=None, media_type=None, tags=None, date_from=None,
            date_to=None, ext=None, folder_id=None, dupes_only=False,
            favorites_only=False, sort_by="date_taken", sort_dir="desc",
            limit=50, offset=0):
     wheres, params = [], []
     if folder_id is not None:
-        wheres.append("m.id IN (SELECT media_id FROM folder_media WHERE folder_id=?)")
-        params.append(folder_id)
+        fids = folder_descendant_ids(conn, folder_id)
+        placeholders = ",".join("?" * len(fids))
+        wheres.append(f"m.id IN (SELECT media_id FROM folder_media WHERE folder_id IN ({placeholders}))")
+        params.extend(fids)
     if query:
         wheres.append("m.id IN (SELECT rowid FROM media_fts WHERE media_fts MATCH ?)")
         params.append(query)
@@ -565,8 +580,11 @@ def get_folders(conn, parent_id=None):
         d = dict(r)
         d["child_count"] = conn.execute(
             "SELECT COUNT(*) FROM folders WHERE parent_id=?", (r["id"],)).fetchone()[0]
+        fids = folder_descendant_ids(conn, r["id"])
+        placeholders = ",".join("?" * len(fids))
         d["media_count"] = conn.execute(
-            "SELECT COUNT(*) FROM folder_media WHERE folder_id=?", (r["id"],)).fetchone()[0]
+            f"SELECT COUNT(DISTINCT media_id) FROM folder_media WHERE folder_id IN ({placeholders})",
+            fids).fetchone()[0]
         result.append(d)
     return result
 
@@ -776,6 +794,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "color:var(--tagtx);border-radius:3px;padding:2px 7px;font-size:11px;"
         "margin:2px;cursor:pointer}\n"
         ".tchip:hover{opacity:.8}\n"
+        ".tchip.on{background:var(--ac);color:#fff}\n"
 
         ".srow{display:flex;justify-content:space-between;font-size:12px;"
         "padding:4px 0;border-bottom:1px solid var(--bd)}\n"
@@ -925,6 +944,22 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         ".dbtn.red:hover{background:var(--red);border-color:var(--red);color:#fff}\n"
         ".fcheck label{display:flex;align-items:center;gap:7px;font-size:11px;"
         "padding:3px 0;cursor:pointer}\n"
+
+        ".fpickbg{position:fixed;inset:0;background:var(--bg);z-index:430;"
+        "display:none;align-items:center;justify-content:center;padding:20px}\n"
+        ".fpickbg.open{display:flex}\n"
+        ".fpick{width:min(480px,100%);max-height:82vh;display:flex;flex-direction:column}\n"
+        ".fpick h1{font-size:30px;font-weight:800;margin:0 0 8px;text-align:center}\n"
+        ".fpick>p{font-size:12px;color:var(--mu);text-align:center;margin:0 0 18px}\n"
+        ".fpicklist{overflow-y:auto;border:1px solid var(--bd);border-radius:var(--r);"
+        "background:var(--sf)}\n"
+        ".fpickrow{display:flex;align-items:center;gap:8px;padding:10px 12px;"
+        "font-size:13px;cursor:pointer;border-bottom:1px solid var(--bd)}\n"
+        ".fpickrow:last-child{border-bottom:none}\n"
+        ".fpickrow:hover{background:var(--sf2);color:var(--ac2)}\n"
+        ".fpickrow .fc{margin-left:auto}\n"
+        ".fpickempty{display:none;text-align:center;font-size:12px;color:var(--mu);margin-top:14px}\n"
+        ".fpickempty a{color:var(--ac2)}\n"
 
         ".dlgbg{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:420;"
         "display:none;align-items:center;justify-content:center;padding:20px}\n"
@@ -1088,6 +1123,16 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "    <div class='ibody' id='ibody'></div>\n"
         "  </div>\n"
         "</div>\n"
+        "<!-- FOLDER PICKER (startup gate) -->\n"
+        "<div class='fpickbg' id='fpickbg'>\n"
+        "  <div class='fpick'>\n"
+        "    <h1>Select a folder</h1>\n"
+        "    <p>Choose which folder to view. Its subfolders are included automatically.</p>\n"
+        "    <div id='fpicklist' class='fpicklist'></div>\n"
+        "    <div id='fpickempty' class='fpickempty'>No folders yet &#8212; "
+        "<a href='#' onclick='skipFolderPicker();return false;'>view all media instead</a>.</div>\n"
+        "  </div>\n"
+        "</div>\n"
         "<!-- DIALOG -->\n"
         "<div class='dlgbg' id='dlgbg'>\n"
         "  <div class='dlg'>\n"
@@ -1177,7 +1222,9 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  if(name==='stats')loadStats();\n"
         "}\n"
 
+        "var loadGen=0;\n"
         "async function loadMedia(){\n"
+        "  var myGen=++loadGen;\n"
         "  var pp=parseInt(g('perPage').value);\n"
         "  var params=new URLSearchParams({\n"
         "    limit:pp,offset:page*pp,\n"
@@ -1193,6 +1240,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  if(g('fFav').checked)params.set('favorites_only','1');\n"
         "  if(activeFolder!==null)params.set('folder_id',activeFolder);\n"
         "  var data=await api('/search?'+params);\n"
+        "  if(myGen!==loadGen)return;\n"
         "  results=data.results;\n"
         "  totalCount=data.total;\n"
         "  g('tcnt').textContent=totalCount+' file'+(totalCount!==1?'s':'');\n"
@@ -1230,7 +1278,8 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "    if(st.fTags)g('fTags').value=st.fTags;\n"
         "    if(st.fDupes)g('fDupes').checked=true;\n"
         "    if(st.fFav)g('fFav').checked=true;\n"
-        "    if(st.activeFolder!=null)activeFolder=st.activeFolder;\n"
+        "    // activeFolder is intentionally NOT restored here - every startup\n"
+        "    // shows the folder picker instead of silently reopening the last folder.\n"
         "  }catch(e){}\n"
         "}\n"
         "function renderMedia(){\n"
@@ -1510,6 +1559,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "}\n"
         "function lbMainClick(e){\n"
         "  if(lbJustDragged){lbJustDragged=false;return;}\n"
+        "  if(e.target.closest&&e.target.closest('.lbnav'))return;\n"
         "  var img=g('lbmedia').querySelector('img');\n"
         "  if(img){if(!lbOnPic(img,e.clientX,e.clientY))closeLb();return;}\n"
         "  if(e.target.id==='lbmain'||e.target.id==='lbmedia')closeLb();\n"
@@ -1664,6 +1714,40 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "}\n"
         "function selFolder(fid){\n"
         "  activeFolder=activeFolder===fid?null:fid;\n"
+        "  cancelThumbs();\n"
+        "  loadTree();goPage(0);\n"
+        "}\n"
+        "function cancelThumbs(){\n"
+        "  var scr=g('mscroll');if(scr)scr.innerHTML='';\n"
+        "}\n"
+        "async function showFolderPicker(){\n"
+        "  var flat=await api('/folders?tree=1');\n"
+        "  if(!flat.length){\n"
+        "    g('fpicklist').style.display='none';\n"
+        "    g('fpickempty').style.display='block';\n"
+        "  } else {\n"
+        "    g('fpicklist').style.display='';\n"
+        "    g('fpickempty').style.display='none';\n"
+        "    g('fpicklist').innerHTML=flat.map(function(f){\n"
+        "      var ind=f.depth*16;\n"
+        "      return '<div class=\"fpickrow\" style=\"padding-left:'+(ind+12)+'px\" "
+        "onclick=\"pickFolder('+f.id+')\">'\n"
+        "        +'<span>&#128193;</span><span>'+esc(f.name)+'</span>'\n"
+        "        +'<span class=\"fc\">'+f.media_count+'</span></div>';\n"
+        "    }).join('');\n"
+        "  }\n"
+        "  g('fpickbg').classList.add('open');\n"
+        "}\n"
+        "function pickFolder(fid){\n"
+        "  activeFolder=fid;\n"
+        "  cancelThumbs();\n"
+        "  g('fpickbg').classList.remove('open');\n"
+        "  loadTree();goPage(0);\n"
+        "}\n"
+        "function skipFolderPicker(){\n"
+        "  activeFolder=null;\n"
+        "  cancelThumbs();\n"
+        "  g('fpickbg').classList.remove('open');\n"
         "  loadTree();goPage(0);\n"
         "}\n"
         "function newFolder(pid){\n"
@@ -1746,14 +1830,18 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
 
         "async function loadTags(){\n"
         "  var tags=await api('/tags');\n"
+        "  var cur=g('fTags').value.trim();\n"
         "  g('tagcloud').innerHTML=tags.map(function(t){\n"
-        "    return '<span class=\"tchip\" onclick=\"ftag(\\''+esc(t.tag)+'\\')\">'+esc(t.tag)\n"
+        "    var on=cur===t.tag?' on':'';\n"
+        "    return '<span class=\"tchip'+on+'\" onclick=\"ftag(\\''+esc(t.tag)+'\\')\">'+esc(t.tag)\n"
         "      +' <small style=\"opacity:.6\">'+t.cnt+'</small></span>';\n"
         "  }).join('')||\n"
         "  '<span style=\"color:var(--mu);font-size:11px\">No tags yet.</span>';\n"
         "}\n"
         "function ftag(tag){\n"
-        "  g('fTags').value=tag;openFilterMenu();goPage(0);\n"
+        "  var f=g('fTags');\n"
+        "  f.value=(f.value.trim()===tag)?'':tag;\n"
+        "  openFilterMenu();goPage(0);loadTags();\n"
         "}\n"
 
         "async function loadStats(){\n"
@@ -1915,7 +2003,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "(async function(){var s=await api('/ingest_status');if(s.running)pollIngest();})();\n"
         "restoreUIState();\n"
         "loadTree();\n"
-        "loadMedia();\n"
+        "showFolderPicker();\n"
         "</script>\n"
         "</body>\n"
         "</html>\n"
