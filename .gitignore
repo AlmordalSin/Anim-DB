@@ -1,0 +1,23 @@
+# SQLite database and journal files (personal data, auto-generated at runtime)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Thumbnail cache (auto-regenerated from your media files)
+*_thumbs/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# PyInstaller build artifacts (only relevant if you package the desktop .exe)
+build/
+dist/
+*.spec
+
+# Editor/OS cruft
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
