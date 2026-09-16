@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-Media Library v4 - clean rewrite.
-Run:  python media_database_v4.py ui
-      python media_database_v4.py app   (native desktop window, requires pywebview)
-      python media_database_v4.py ingest /path/to/folder --mirror-folders
+AnimDB - clean rewrite.
+Run:  python animdb.py ui
+      python animdb.py app   (native desktop window, requires pywebview)
+      python animdb.py ingest /path/to/folder --mirror-folders
 Optional deps: pip install Pillow opencv-python send2trash pywebview
-Default DB:    media_library_v4.db (resolved next to this script/exe, not the CWD)
+Default DB:    animdb.db (resolved next to this script/exe, not the CWD)
 Default port:  7500
+
+Legacy: a database file from before the AnimDB rename was named
+media_library_v4.db. When the default DB path is used and animdb.db doesn't
+exist yet but a media_library_v4.db does (same folder), it is migrated
+in place (renamed) on startup - see migrate_legacy_db_filename().
 """
 
 import os, sys, json, sqlite3, hashlib, argparse, datetime, threading, email.utils
@@ -34,18 +39,43 @@ except ImportError:
 
 IMAGE_EXTS = {".jpg",".jpeg",".png",".gif",".bmp",".webp",".tiff",".heic"}
 VIDEO_EXTS = {".mp4",".mov",".avi",".mkv",".webm",".m4v",".flv",".wmv"}
-DEFAULT_DB   = "media_library_v4.db"
+DEFAULT_DB        = "animdb.db"
+LEGACY_DEFAULT_DB = "media_library_v4.db"
 DEFAULT_PORT = 7500
 
 def app_base_dir():
     """Directory the default DB path is resolved against: the folder containing
-    this script when run with `python media_database_v4.py`, or the folder
+    this script when run with `python animdb.py`, or the folder
     containing the .exe when frozen with PyInstaller. Deliberately NOT the
     process's current working directory, which is unpredictable for a
     double-clicked desktop app (and was the previous, CWD-relative default)."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+def migrate_legacy_db_filename(db_path):
+    """If `db_path` is the (not-yet-existing) default animdb.db location and a
+    pre-rename media_library_v4.db sits next to it, rename that file in place
+    so existing libraries keep working after the AnimDB rename. Same-directory
+    os.replace is atomic - nothing is copied or at risk. No-op whenever the
+    caller passed an explicit --db path, or animdb.db already exists, or there
+    is no legacy file to migrate."""
+    if os.path.exists(db_path):
+        return
+    if os.path.basename(db_path) != DEFAULT_DB:
+        return
+    legacy = os.path.join(os.path.dirname(db_path), LEGACY_DEFAULT_DB)
+    if not os.path.exists(legacy):
+        return
+    try:
+        os.replace(legacy, db_path)
+        print(f"  Migrated existing database: {LEGACY_DEFAULT_DB} -> {DEFAULT_DB}")
+        for suffix in ("-wal", "-shm"):
+            leg_aux = legacy + suffix
+            if os.path.exists(leg_aux):
+                os.replace(leg_aux, db_path + suffix)
+    except OSError as e:
+        print(f"  Warning: could not migrate {LEGACY_DEFAULT_DB} to {DEFAULT_DB}: {e}")
 
 SORT_MAP = {
     "date_taken": "COALESCE(m.date_taken, m.date_added)",
@@ -100,6 +130,15 @@ def get_db(path):
             added_at  TEXT NOT NULL,
             PRIMARY KEY(folder_id, media_id)
         );
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+        CREATE TABLE IF NOT EXISTS managed_folders (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            path     TEXT NOT NULL UNIQUE,
+            added_at TEXT NOT NULL
+        );
         CREATE VIRTUAL TABLE IF NOT EXISTS media_fts
             USING fts5(file_name, description, content=media, content_rowid=id);
         CREATE TRIGGER IF NOT EXISTS media_ai AFTER INSERT ON media BEGIN
@@ -139,6 +178,77 @@ def get_db(path):
     conn.commit()
 
     return conn
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SETTINGS / DEVICE MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+# `settings` is a plain key/value store for app-wide preferences that need to
+# be enforced on the server (things a client-side-only localStorage value
+# can't gate, like whether AnimDB is allowed to touch disk at all).
+# `managed_folders` is the list of folders AnimDB has been told to look
+# after; a folder is added to it automatically the first time it's ingested.
+# Clearing the list is just bookkeeping - it does not block re-ingesting
+# those paths later. The one real gate is DEVICE_MGMT_KEY below: when it's
+# off, every disk-writing operation refuses to run, regardless of the list.
+DEVICE_MGMT_KEY = "device_management_enabled"
+AUTO_INGEST_KEY = "auto_ingest_on_startup"
+DEFAULT_SETTINGS = {
+    DEVICE_MGMT_KEY: "1",
+    AUTO_INGEST_KEY: "0",
+}
+
+class DeviceManagementDisabledError(Exception):
+    """Raised by any disk-writing operation (ingest, rename, move, delete)
+    when the device-management master switch in Settings is turned off."""
+    pass
+
+def get_setting(conn, key, default=None):
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    if row is None or row["value"] is None:
+        return DEFAULT_SETTINGS.get(key, default)
+    return row["value"]
+
+def set_setting(conn, key, value):
+    conn.execute(
+        "INSERT INTO settings(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value)))
+    conn.commit()
+
+def get_all_settings(conn):
+    out = dict(DEFAULT_SETTINGS)
+    for r in conn.execute("SELECT key, value FROM settings"):
+        out[r["key"]] = r["value"]
+    return out
+
+def device_management_enabled(conn):
+    return get_setting(conn, DEVICE_MGMT_KEY, "1") == "1"
+
+def require_device_management(conn):
+    if not device_management_enabled(conn):
+        raise DeviceManagementDisabledError(
+            "AnimDB's device management is turned off in Settings, so it "
+            "can't ingest, rename, move, or delete files right now.")
+
+def get_managed_folders(conn):
+    return [dict(r) for r in conn.execute(
+        "SELECT id, path, added_at FROM managed_folders ORDER BY path")]
+
+def add_managed_folder(conn, path):
+    path = str(Path(path).resolve())
+    now = datetime.datetime.now().isoformat()
+    conn.execute(
+        "INSERT OR IGNORE INTO managed_folders(path,added_at) VALUES(?,?)",
+        (path, now))
+    conn.commit()
+
+def remove_managed_folder(conn, folder_id):
+    conn.execute("DELETE FROM managed_folders WHERE id=?", (folder_id,))
+    conn.commit()
+
+def clear_managed_folders(conn):
+    conn.execute("DELETE FROM managed_folders")
+    conn.commit()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # METADATA
@@ -365,6 +475,7 @@ def ingest_file(conn, path, force=False):
     """Ingest a single file, compute + write on the caller's thread. Used by
     the CLI's single-file case and anywhere else a plain sequential ingest
     of one path is wanted."""
+    require_device_management(conn)
     path = str(Path(path).resolve())
     ext  = Path(path).suffix.lower()
     if ext not in IMAGE_EXTS and ext not in VIDEO_EXTS:
@@ -385,6 +496,8 @@ def ingest_dir(conn, directory, recursive=True, force=False, mirror=False,
     every actual SQLite write happens back on this (the caller's) thread -
     this is what lets a large first-time import run several files at once
     without risking concurrent-write issues."""
+    require_device_management(conn)
+    add_managed_folder(conn, directory)
     root = Path(directory)
     folder_cache = {}
 
@@ -609,6 +722,7 @@ def create_folder(conn, name, parent_id=None, disk_path=""):
 # DISK OPERATIONS
 # ─────────────────────────────────────────────────────────────────────────────
 def disk_rename(conn, media_id, new_name):
+    require_device_management(conn)
     row = conn.execute("SELECT file_path FROM media WHERE id=?", (media_id,)).fetchone()
     if not row:
         raise FileNotFoundError("Not in database")
@@ -621,6 +735,7 @@ def disk_rename(conn, media_id, new_name):
     return str(new)
 
 def disk_move(conn, media_id, dest_folder):
+    require_device_management(conn)
     row = conn.execute("SELECT file_path,file_name FROM media WHERE id=?", (media_id,)).fetchone()
     if not row:
         raise FileNotFoundError("Not in database")
@@ -633,6 +748,7 @@ def disk_move(conn, media_id, dest_folder):
     return str(new_path)
 
 def disk_delete(conn, media_id, permanent=False):
+    require_device_management(conn)
     row = conn.execute("SELECT file_path FROM media WHERE id=?", (media_id,)).fetchone()
     if not row:
         raise FileNotFoundError("Not in database")
@@ -720,20 +836,52 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
                 ingest_state["finished_at"] = datetime.datetime.now().isoformat()
             ing_conn.close()
 
+    def _run_startup_autoingest():
+        """Settings > 'Auto-ingest on every startup': sequentially re-scan
+        every managed folder using the same background-ingest machinery as
+        the UI's Rescan/Ingest button, so progress still shows up in the
+        ingest pill. Skipped entirely if device management is off or there's
+        nothing to scan."""
+        for mf in get_managed_folders(conn):
+            folder = mf["path"]
+            if not os.path.isdir(folder):
+                continue
+            with ingest_lock:
+                if ingest_state["running"]:
+                    return
+                ingest_state.update({
+                    "running": True, "folder": folder, "current": 0, "total": 0,
+                    "counts": {}, "done": False, "error": None,
+                    "started_at": datetime.datetime.now().isoformat(),
+                    "finished_at": None,
+                })
+            _run_ingest_bg(folder, mirror=False, force=False, recursive=True)
+
+    if device_management_enabled(conn) and get_setting(conn, AUTO_INGEST_KEY, "0") == "1":
+        threading.Thread(target=_run_startup_autoingest, daemon=True).start()
+
     PAGE = (
         "<!DOCTYPE html>\n"
         "<html lang='en'>\n"
         "<head>\n"
         "<meta charset='UTF-8'>\n"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>\n"
-        "<title>Media Library v4</title>\n"
+        "<title>AnimDB</title>\n"
+        "<script>try{var _t=localStorage.getItem('animdb_theme');"
+        "if(_t)document.documentElement.setAttribute('data-theme',_t);}catch(e){}</script>\n"
         "<style>\n"
         ":root{"
         "--bg:#111318;--sf:#1a1d24;--sf2:#22262f;--bd:#2d3140;"
         "--ac:#5b8af0;--ac2:#7aa3f5;--tx:#dde2f0;--mu:#7880a0;"
         "--red:#e05468;--green:#3ecf8e;--tagbg:#1e2d5a;--tagtx:#7aa3f5;"
+        "--lbbg:rgba(0,0,0,.95);"
         "--r:6px;--fn:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
         "--mo:'SF Mono','Fira Code',monospace;"
+        "}\n"
+        "[data-theme='light']{"
+        "--bg:#f4f5f8;--sf:#ffffff;--sf2:#eef0f5;--bd:#dde1ea;"
+        "--ac:#3f6fd6;--ac2:#3f6fd6;--tx:#1c2030;--mu:#6b7288;"
+        "--red:#d33a52;--green:#1f9d68;--tagbg:#dbe6ff;--tagtx:#2f5fc7;"
         "}\n"
         "*{box-sizing:border-box;margin:0;padding:0}\n"
         "body{background:var(--bg);color:var(--tx);font-family:var(--fn);"
@@ -799,6 +947,24 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         ".srow{display:flex;justify-content:space-between;font-size:12px;"
         "padding:4px 0;border-bottom:1px solid var(--bd)}\n"
         ".srow span:last-child{color:var(--ac2);font-weight:600}\n"
+
+        ".setsec{margin-bottom:18px}\n"
+        ".setsec h4{font-size:10px;color:var(--mu);text-transform:uppercase;"
+        "letter-spacing:.5px;margin-bottom:8px}\n"
+        ".swrow{display:flex;align-items:center;gap:7px;font-size:12px;"
+        "cursor:pointer;margin-bottom:6px}\n"
+        ".sethint{font-size:10.5px;color:var(--mu);margin:-2px 0 10px;line-height:1.4}\n"
+        ".mfrow{display:flex;align-items:center;gap:6px;padding:4px 6px;"
+        "border-radius:var(--r);font-size:11px}\n"
+        ".mfrow:hover{background:var(--sf2)}\n"
+        ".mfpath{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+        "font-family:var(--mo);font-size:10px}\n"
+        ".mfempty{font-size:11px;color:var(--mu)}\n"
+        ".themerow{display:flex;gap:6px;margin-bottom:4px}\n"
+        ".lbswatches{display:flex;gap:8px;align-items:center;flex-wrap:wrap}\n"
+        ".lbswatch{width:24px;height:24px;border-radius:50%;border:2px solid var(--bd);"
+        "cursor:pointer;padding:0}\n"
+        ".lbswatch.on{border-color:var(--ac)}\n"
 
         ".content{flex:1;display:flex;flex-direction:column;overflow:hidden}\n"
         ".toolbar{padding:8px 16px;background:var(--sf);border-bottom:1px solid var(--bd);"
@@ -879,7 +1045,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         ".empty{text-align:center;padding:60px 20px;color:var(--mu)}\n"
         ".eico{font-size:44px;margin-bottom:10px}\n"
 
-        ".lbox{position:fixed;inset:0;background:rgba(0,0,0,.95);z-index:200;"
+        ".lbox{position:fixed;inset:0;background:var(--lbbg);z-index:200;"
         "display:none;flex-direction:column}\n"
         ".lbox.open{display:flex}\n"
         ".lbtop{position:relative;z-index:10;display:flex;align-items:center;padding:9px 14px;gap:10px;"
@@ -1017,7 +1183,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "</head>\n"
         "<body>\n"
         "<div class='topbar'>\n"
-        "  <div class='logo'>&#128193; Media Library <small>v4</small></div>\n"
+        "  <div class='logo'>&#128193; AnimDB</div>\n"
         "  <input class='srch' id='q' placeholder='Search filenames and descriptions&#8230;' />\n"
         "  <label style='font-size:11px;color:var(--mu)'>Sort</label>\n"
         "  <select class='sel' id='sortBy' onchange='goPage(0)'>\n"
@@ -1060,6 +1226,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "    <div class='stab on' onclick=\"showSB('folders')\">Folders</div>\n"
         "    <div class='stab' onclick=\"showSB('tags')\">Tags</div>\n"
         "    <div class='stab' onclick=\"showSB('stats')\">Stats</div>\n"
+        "    <div class='stab' onclick=\"showSB('settings')\">Settings</div>\n"
         "  </div>\n"
         "  <div class='sbody'>\n"
         "    <div id='sb-folders'>\n"
@@ -1068,6 +1235,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "    </div>\n"
         "    <div id='sb-tags' style='display:none'><div id='tagcloud'></div></div>\n"
         "    <div id='sb-stats' style='display:none'><div id='statpanel'></div></div>\n"
+        "    <div id='sb-settings' style='display:none'><div id='settingspanel'></div></div>\n"
         "  </div>\n"
         "</div>\n"
         "<div class='content'>\n"
@@ -1083,6 +1251,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  </div>\n"
         "  <div class='bulkbar' id='bulkbar'>\n"
         "    <span id='bkcnt'>0 selected</span>\n"
+        "    <button class='bb' onclick='selectAll()'>&#9745; Select All</button>\n"
         "    <button class='bb' onclick='bulkTag()'>&#127991;&#65039; Tag&#8230;</button>\n"
         "    <button class='bb' onclick='bulkMove()'>&#128193; Move&#8230;</button>\n"
         "    <button class='bb red' onclick='bulkDelete()'>&#128465; Delete</button>\n"
@@ -1210,16 +1379,18 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  }\n"
         "});\n"
 
+        "var SBTABS=['folders','tags','stats','settings'];\n"
         "function showSB(name){\n"
-        "  ['folders','tags','stats'].forEach(function(n){\n"
+        "  SBTABS.forEach(function(n){\n"
         "    g('sb-'+n).style.display=n===name?'':'none';\n"
         "  });\n"
         "  document.querySelectorAll('.stab').forEach(function(el,i){\n"
-        "    el.classList.toggle('on',['folders','tags','stats'][i]===name);\n"
+        "    el.classList.toggle('on',SBTABS[i]===name);\n"
         "  });\n"
         "  if(name==='folders')loadTree();\n"
         "  if(name==='tags')loadTags();\n"
         "  if(name==='stats')loadStats();\n"
+        "  if(name==='settings')loadSettings();\n"
         "}\n"
 
         "var loadGen=0;\n"
@@ -1404,6 +1575,10 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  else bar.classList.remove('show');\n"
         "}\n"
         "function clearSel(){sel.clear();updBulk();renderMedia();}\n"
+        "function selectAll(){\n"
+        "  results.forEach(function(m){sel.add(m.id);});\n"
+        "  updBulk();renderMedia();\n"
+        "}\n"
         "function bulkTag(){\n"
         "  showDlg('Tag '+sel.size+' files',\n"
         "    'Enter tags to add (space or comma separated).','','',\n"
@@ -1858,6 +2033,89 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "    +(s.dup_groups?' ('+s.dup_groups+')':'')+'</button>';\n"
         "}\n"
 
+        "async function loadSettings(){\n"
+        "  var data=await api('/settings');\n"
+        "  renderSettings(data);\n"
+        "}\n"
+        "var LB_COLORS=['rgba(0,0,0,.95)','#0c0e13','#111827','#1c2030','#241b2e','#ffffff'];\n"
+        "function renderSettings(data){\n"
+        "  var s=data.settings||{};\n"
+        "  var mf=data.managed_folders||[];\n"
+        "  var devOn=s.device_management_enabled==='1';\n"
+        "  var autoOn=s.auto_ingest_on_startup==='1';\n"
+        "  var curTheme=document.documentElement.getAttribute('data-theme')==='light'?'light':'dark';\n"
+        "  var curLb=getComputedStyle(document.documentElement).getPropertyValue('--lbbg').trim();\n"
+        "  var html='';\n"
+        "  html+='<div class=\"setsec\"><h4>Device Management</h4>'\n"
+        "    +'<label class=\"swrow\"><input type=\"checkbox\" id=\"setDevMgmt\"'+(devOn?' checked':'')\n"
+        "    +' onchange=\"toggleDevMgmt(this.checked)\"> Let AnimDB manage folders &amp; media on this device</label>'\n"
+        "    +'<div class=\"sethint\">When off, AnimDB does not ingest, rename, move, or delete '\n"
+        "    +'anything on disk, even from the command line.</div></div>';\n"
+        "  html+='<div class=\"setsec\"><label class=\"swrow\"><input type=\"checkbox\" id=\"setAutoIngest\"'\n"
+        "    +(autoOn?' checked':'')+' onchange=\"toggleAutoIngest(this.checked)\"> Auto-ingest managed '\n"
+        "    +'folders on startup</label>'\n"
+        "    +'<div class=\"sethint\">Rescans every managed folder each time AnimDB starts.</div></div>';\n"
+        "  html+='<div class=\"setsec\"><h4>Managed Folders</h4>';\n"
+        "  if(mf.length){\n"
+        "    html+=mf.map(function(f){\n"
+        "      return '<div class=\"mfrow\"><span class=\"mfpath\" title=\"'+esc(f.path)+'\">'+esc(f.path)+'</span>'\n"
+        "        +'<span class=\"tgl\" onclick=\"removeManagedFolder('+f.id+')\" title=\"Remove from list\">&#x2715;</span></div>';\n"
+        "    }).join('');\n"
+        "    html+='<button class=\"fbtn ghost\" style=\"margin-top:8px\" onclick=\"clearManagedFolders()\">Clear All</button>';\n"
+        "  } else {\n"
+        "    html+='<div class=\"mfempty\">No folders ingested yet.</div>';\n"
+        "  }\n"
+        "  html+='</div>';\n"
+        "  html+='<div class=\"setsec\"><h4>Appearance</h4><div class=\"themerow\">'\n"
+        "    +'<button class=\"vbtn'+(curTheme==='dark'?' on':'')+'\" onclick=\"setTheme(\\'dark\\')\">Dark</button>'\n"
+        "    +'<button class=\"vbtn'+(curTheme==='light'?' on':'')+'\" onclick=\"setTheme(\\'light\\')\">Light</button>'\n"
+        "    +'</div></div>';\n"
+        "  html+='<div class=\"setsec\"><h4>Lightbox Background</h4><div class=\"lbswatches\">'\n"
+        "    +LB_COLORS.map(function(c){\n"
+        "      var on=curLb===c?' on':'';\n"
+        "      return '<button class=\"lbswatch'+on+'\" style=\"background:'+c+'\" "
+        "onclick=\"setLbColor(\\''+c+'\\')\" title=\"'+c+'\"></button>';\n"
+        "    }).join('')\n"
+        "    +'<input type=\"color\" id=\"lbcustom\" onchange=\"setLbColor(this.value)\" title=\"Custom color\" '\n"
+        "    +'style=\"width:24px;height:24px;padding:0;border:2px solid var(--bd);border-radius:50%;"
+        "cursor:pointer;background:none\" />';\n"
+        "  html+='</div></div>';\n"
+        "  g('settingspanel').innerHTML=html;\n"
+        "}\n"
+        "async function toggleDevMgmt(on){\n"
+        "  var r=await api('/settings','POST',{device_management_enabled:on});\n"
+        "  toast(on?'Device management enabled':'Device management disabled',r.error?'err':'ok');\n"
+        "  loadSettings();\n"
+        "}\n"
+        "async function toggleAutoIngest(on){\n"
+        "  await api('/settings','POST',{auto_ingest_on_startup:on});\n"
+        "  toast(on?'Auto-ingest on startup enabled':'Auto-ingest on startup disabled','ok');\n"
+        "}\n"
+        "async function removeManagedFolder(id){\n"
+        "  await api('/managed_folders/remove','POST',{id:id});\n"
+        "  toast('Removed from managed folders','ok');loadSettings();\n"
+        "}\n"
+        "function clearManagedFolders(){\n"
+        "  showDlg('Clear managed folders',\n"
+        "    'This clears the list only; it does not delete anything on disk, and ingesting '\n"
+        "    +'these folders again will re-add them automatically.',\n"
+        "    '','','','Clear All',true,\n"
+        "    async function(){\n"
+        "      await api('/managed_folders/clear','POST',{});\n"
+        "      toast('Managed folders cleared','ok');loadSettings();\n"
+        "    });\n"
+        "}\n"
+        "function setTheme(t){\n"
+        "  document.documentElement.setAttribute('data-theme',t);\n"
+        "  try{localStorage.setItem('animdb_theme',t);}catch(e){}\n"
+        "  loadSettings();\n"
+        "}\n"
+        "function setLbColor(c){\n"
+        "  document.documentElement.style.setProperty('--lbbg',c);\n"
+        "  try{localStorage.setItem('animdb_lbbg',c);}catch(e){}\n"
+        "  loadSettings();\n"
+        "}\n"
+
         "async function openDupes(){\n"
         "  g('dupbg').classList.add('open');\n"
         "  await loadDupes();\n"
@@ -2001,6 +2259,8 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
 
         "g('q').addEventListener('input',dbt(function(){goPage(0);}));\n"
         "(async function(){var s=await api('/ingest_status');if(s.running)pollIngest();})();\n"
+        "try{var _lb=localStorage.getItem('animdb_lbbg');"
+        "if(_lb)document.documentElement.style.setProperty('--lbbg',_lb);}catch(e){}\n"
         "restoreUIState();\n"
         "loadTree();\n"
         "showFolderPicker();\n"
@@ -2177,6 +2437,13 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
                                 "folders": folders, "dup_groups": dups})
                 return
 
+            if ap == "/settings":
+                self.send_json({
+                    "settings": get_all_settings(conn),
+                    "managed_folders": get_managed_folders(conn),
+                })
+                return
+
             if ap == "/tags":
                 rows = conn.execute(
                     "SELECT tag, COUNT(*) AS cnt FROM tags "
@@ -2296,7 +2563,32 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
                 fid = create_folder(conn, body.get("name", "New Folder"), parent_id=pid)
                 self.send_json({"id": fid, "ok": True}); return
 
+            if p == "/api/settings":
+                if DEVICE_MGMT_KEY in body:
+                    set_setting(conn, DEVICE_MGMT_KEY, "1" if body[DEVICE_MGMT_KEY] else "0")
+                if AUTO_INGEST_KEY in body:
+                    set_setting(conn, AUTO_INGEST_KEY, "1" if body[AUTO_INGEST_KEY] else "0")
+                self.send_json({"ok": True, "settings": get_all_settings(conn)})
+                return
+
+            if p == "/api/managed_folders/remove":
+                fid = body.get("id")
+                if fid is None:
+                    self.send_json({"error": "id is required"}, 400); return
+                remove_managed_folder(conn, fid)
+                self.send_json({"ok": True, "managed_folders": get_managed_folders(conn)})
+                return
+
+            if p == "/api/managed_folders/clear":
+                clear_managed_folders(conn)
+                self.send_json({"ok": True, "managed_folders": get_managed_folders(conn)})
+                return
+
             if p == "/api/ingest":
+                if not device_management_enabled(conn):
+                    self.send_json({"error": "AnimDB's device management is turned off in "
+                                              "Settings, so it can't ingest folders right now."}, 403)
+                    return
                 folder = (body.get("folder") or "").strip().strip('"')
                 if not folder:
                     self.send_json({"error": "Folder path is required"}, 400); return
@@ -2324,6 +2616,8 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
                 try:
                     new_path = disk_rename(conn, body["media_id"], body["new_name"])
                     self.send_json({"ok": True, "new_path": new_path})
+                except DeviceManagementDisabledError as e:
+                    self.send_json({"error": str(e)}, 403)
                 except Exception as e:
                     self.send_json({"error": str(e)}, 400)
                 return
@@ -2332,6 +2626,8 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
                 try:
                     new_path = disk_move(conn, body["media_id"], body["dest_folder"])
                     self.send_json({"ok": True, "new_path": new_path})
+                except DeviceManagementDisabledError as e:
+                    self.send_json({"error": str(e)}, 403)
                 except Exception as e:
                     self.send_json({"error": str(e)}, 400)
                 return
@@ -2340,6 +2636,8 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
                 try:
                     disk_delete(conn, body["media_id"], permanent=body.get("permanent", False))
                     self.send_json({"ok": True})
+                except DeviceManagementDisabledError as e:
+                    self.send_json({"error": str(e)}, 403)
                 except Exception as e:
                     self.send_json({"error": str(e)}, 400)
                 return
@@ -2408,7 +2706,7 @@ def run_ui(db_path, host="127.0.0.1", port=DEFAULT_PORT):
     """CLI `ui` command: build the server and block in the foreground,
     exactly as before - unchanged behavior for existing terminal usage."""
     server, conn = _build_server(db_path, host, port)
-    print(f"\n  Media Library v4 running at http://{host}:{port}")
+    print(f"\n  AnimDB running at http://{host}:{port}")
     print(f"  Database : {os.path.abspath(db_path)}")
     print(f"  Press Ctrl+C to stop.\n")
     try:
@@ -2434,7 +2732,7 @@ def run_desktop_app(db_path, host="127.0.0.1", port=DEFAULT_PORT):
     thread.start()
 
     window = webview.create_window(
-        "Media Library",
+        "AnimDB",
         f"http://{host}:{port}",
         width=1360, height=860, min_size=(900, 600),
     )
@@ -2458,8 +2756,8 @@ def run_desktop_app(db_path, host="127.0.0.1", port=DEFAULT_PORT):
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
-        prog="media_database_v4",
-        description="Media Library v4")
+        prog="animdb",
+        description="AnimDB")
     ap.add_argument("--db", default=None,
                     help=f"Database file (default: {DEFAULT_DB}, next to this "
                          f"script/exe - not the current directory)")
@@ -2487,6 +2785,7 @@ def main():
     args = ap.parse_args()
     if args.db is None:
         args.db = os.path.join(app_base_dir(), DEFAULT_DB)
+    migrate_legacy_db_filename(args.db)
     conn = get_db(args.db)
 
     if args.cmd == "ui":
@@ -2498,19 +2797,22 @@ def main():
         run_desktop_app(args.db, args.host, args.port)
 
     elif args.cmd == "ingest":
-        for path in args.paths:
-            if os.path.isfile(path):
-                print(f"  {ingest_file(conn, path, args.force)}: {path}")
-            elif os.path.isdir(path):
-                print(f"Scanning {path} ...")
-                counts = ingest_dir(conn, path,
-                                    recursive=not args.no_recursive,
-                                    force=args.force,
-                                    mirror=args.mirror_folders,
-                                    workers=args.workers)
-                print(f"Done: {counts}")
-            else:
-                print(f"  Not found: {path}")
+        try:
+            for path in args.paths:
+                if os.path.isfile(path):
+                    print(f"  {ingest_file(conn, path, args.force)}: {path}")
+                elif os.path.isdir(path):
+                    print(f"Scanning {path} ...")
+                    counts = ingest_dir(conn, path,
+                                        recursive=not args.no_recursive,
+                                        force=args.force,
+                                        mirror=args.mirror_folders,
+                                        workers=args.workers)
+                    print(f"Done: {counts}")
+                else:
+                    print(f"  Not found: {path}")
+        except DeviceManagementDisabledError as e:
+            print(f"  {e}")
         conn.close()
 
     elif args.cmd == "stats":
