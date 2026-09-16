@@ -4,7 +4,11 @@ AnimDB - clean rewrite.
 Run:  python animdb.py ui
       python animdb.py app   (native desktop window, requires pywebview)
       python animdb.py ingest /path/to/folder --mirror-folders
-Optional deps: pip install Pillow opencv-python send2trash pywebview
+      python animdb.py --version
+Optional deps: pip install Pillow opencv-python-headless send2trash pywebview
+               (a packaged .exe downloads these itself on first run if
+               missing - see _ensure_optional_dependencies(). Set
+               ANIMDB_NO_AUTO_DEPS=1 to disable that and install by hand.)
 Default DB:    animdb.db (resolved next to this script/exe, not the CWD)
 Default port:  7500
 
@@ -17,6 +21,95 @@ in place (renamed) on startup - see migrate_legacy_db_filename().
 import os, sys, json, sqlite3, hashlib, argparse, datetime, threading, email.utils
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+VERSION = "1.1.0"
+
+IMAGE_EXTS = {".jpg",".jpeg",".png",".gif",".bmp",".webp",".tiff",".heic"}
+VIDEO_EXTS = {".mp4",".mov",".avi",".mkv",".webm",".m4v",".flv",".wmv"}
+DEFAULT_DB        = "animdb.db"
+LEGACY_DEFAULT_DB = "media_library_v4.db"
+DEFAULT_PORT = 7500
+
+def app_base_dir():
+    """Directory the default DB path is resolved against: the folder containing
+    this script when run with `python animdb.py`, or the folder
+    containing the .exe when frozen with PyInstaller. Deliberately NOT the
+    process's current working directory, which is unpredictable for a
+    double-clicked desktop app (and was the previous, CWD-relative default)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def _vendor_dir():
+    """Where first-run-downloaded optional dependencies live: a plain folder
+    next to the script/exe, never the system/site Python. Deleting this
+    folder fully undoes the download with no other side effects."""
+    return os.path.join(app_base_dir(), "vendor")
+
+def _ensure_optional_dependencies():
+    """First-run bootstrap for a packaged .exe (or a bare `python animdb.py`
+    on a machine that only has pywebview installed): Pillow, opencv-python,
+    and send2trash are all optional - the app already runs without them,
+    just without thumbnails/EXIF/GPS, video metadata, and Recycle-Bin
+    support respectively. Most people downloading a finished .exe want the
+    full experience without ever opening a terminal, so if any of the three
+    can't be imported, this pip-installs them into a local 'vendor' folder
+    next to the script/exe (isolated from the system Python) and adds that
+    folder to sys.path so the imports right below this function succeed.
+
+    This never touches anything outside that vendor folder, runs only once
+    (later launches import successfully with no network call at all), and
+    fails silently into the same degraded-but-working mode the app has
+    always had if there's no internet connection or pip isn't available -
+    set ANIMDB_NO_AUTO_DEPS=1 to skip it outright (e.g. for an offline or
+    fully-controlled deployment)."""
+    if os.environ.get("ANIMDB_NO_AUTO_DEPS"):
+        return
+    vendor = _vendor_dir()
+    if os.path.isdir(vendor) and vendor not in sys.path:
+        sys.path.insert(0, vendor)
+
+    packages = []
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        packages.append("Pillow")
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        packages.append("opencv-python-headless")
+    try:
+        import send2trash  # noqa: F401
+    except ImportError:
+        packages.append("send2trash")
+    if not packages:
+        return
+
+    try:
+        from pip._internal.cli.main import main as _pip_main
+    except ImportError:
+        return  # No pip available (e.g. a minimal frozen build without it) - stay degraded.
+
+    print(f"\n  Setting up AnimDB for the first time - downloading {', '.join(packages)}...")
+    print("  This happens once and needs an internet connection; safe to ignore if you're offline.")
+    try:
+        os.makedirs(vendor, exist_ok=True)
+        code = _pip_main(["install", "--quiet", "--disable-pip-version-check",
+                           "--timeout", "20", "--retries", "1",
+                           "--target", vendor, *packages])
+        if code == 0:
+            if vendor not in sys.path:
+                sys.path.insert(0, vendor)
+            print("  Done.\n")
+        else:
+            print("  Could not download every optional dependency - continuing without them.\n")
+    except Exception as e:
+        print(f"  Could not download optional dependencies automatically ({e}).")
+        print(f"  AnimDB will keep running without them. To install by hand later:")
+        print(f"    pip install {' '.join(p for p in packages if p != 'opencv-python-headless')}"
+              + (" opencv-python-headless" if "opencv-python-headless" in packages else "") + "\n")
+
+_ensure_optional_dependencies()
 
 try:
     from PIL import Image, ImageOps
@@ -36,22 +129,6 @@ try:
     TRASH_OK = True
 except ImportError:
     TRASH_OK = False
-
-IMAGE_EXTS = {".jpg",".jpeg",".png",".gif",".bmp",".webp",".tiff",".heic"}
-VIDEO_EXTS = {".mp4",".mov",".avi",".mkv",".webm",".m4v",".flv",".wmv"}
-DEFAULT_DB        = "animdb.db"
-LEGACY_DEFAULT_DB = "media_library_v4.db"
-DEFAULT_PORT = 7500
-
-def app_base_dir():
-    """Directory the default DB path is resolved against: the folder containing
-    this script when run with `python animdb.py`, or the folder
-    containing the .exe when frozen with PyInstaller. Deliberately NOT the
-    process's current working directory, which is unpredictable for a
-    double-clicked desktop app (and was the previous, CWD-relative default)."""
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
 
 def migrate_legacy_db_filename(db_path):
     """If `db_path` is the (not-yet-existing) default animdb.db location and a
@@ -249,6 +326,55 @@ def remove_managed_folder(conn, folder_id):
 def clear_managed_folders(conn):
     conn.execute("DELETE FROM managed_folders")
     conn.commit()
+
+def _media_and_folder_ids_under(conn, folder_paths):
+    """Return (media_ids, folder_ids) for every media row and every virtual
+    folder whose path is at or beneath one of `folder_paths`. Used by the
+    Settings > 'Reset Managed Folders' danger-zone action; matching is done
+    in Python via pathlib rather than SQL LIKE so folder names containing
+    '%' or '_' can't produce a wrong match."""
+    media_ids, folder_ids = [], []
+    if not folder_paths:
+        return media_ids, folder_ids
+    for r in conn.execute("SELECT id, file_path FROM media").fetchall():
+        p = Path(r["file_path"])
+        if any(fp in p.parents for fp in folder_paths):
+            media_ids.append(r["id"])
+    for r in conn.execute(
+            "SELECT id, disk_path FROM folders WHERE disk_path != ''").fetchall():
+        dp = Path(r["disk_path"])
+        if any(dp == fp or fp in dp.parents for fp in folder_paths):
+            folder_ids.append(r["id"])
+    return media_ids, folder_ids
+
+def reset_managed_folders_preview(conn):
+    """Counts what a reset would remove, without removing anything - used
+    to show the user real numbers before they confirm the destructive
+    action below."""
+    folders = get_managed_folders(conn)
+    folder_paths = [Path(mf["path"]) for mf in folders]
+    media_ids, _ = _media_and_folder_ids_under(conn, folder_paths)
+    return {"folders": len(folder_paths), "media": len(media_ids)}
+
+def reset_managed_folders(conn):
+    """Settings > 'Reset Managed Folders' (danger zone): permanently removes
+    every media record - and, via ON DELETE CASCADE, its tags and
+    folder_media links - that lives under a currently-managed folder,
+    removes the virtual folders created for those paths, and clears the
+    managed_folders list itself. This never touches files on disk; it only
+    resets AnimDB's own database records, so the folders can be re-ingested
+    from scratch afterward."""
+    require_device_management(conn)
+    folders = get_managed_folders(conn)
+    folder_paths = [Path(mf["path"]) for mf in folders]
+    media_ids, folder_ids = _media_and_folder_ids_under(conn, folder_paths)
+    if media_ids:
+        conn.executemany("DELETE FROM media WHERE id=?", [(i,) for i in media_ids])
+    if folder_ids:
+        conn.executemany("DELETE FROM folders WHERE id=?", [(i,) for i in folder_ids])
+    clear_managed_folders(conn)
+    conn.commit()
+    return {"folders": len(folder_paths), "media": len(media_ids)}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # METADATA
@@ -698,6 +824,10 @@ def get_folders(conn, parent_id=None):
         d["media_count"] = conn.execute(
             f"SELECT COUNT(DISTINCT media_id) FROM folder_media WHERE folder_id IN ({placeholders})",
             fids).fetchone()[0]
+        d["media_size"] = conn.execute(
+            f"SELECT COALESCE(SUM(file_size),0) FROM media WHERE id IN "
+            f"(SELECT DISTINCT media_id FROM folder_media WHERE folder_id IN ({placeholders}))",
+            fids).fetchone()[0]
         result.append(d)
     return result
 
@@ -867,21 +997,26 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "<meta charset='UTF-8'>\n"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>\n"
         "<title>AnimDB</title>\n"
-        "<script>try{var _t=localStorage.getItem('animdb_theme');"
-        "if(_t)document.documentElement.setAttribute('data-theme',_t);}catch(e){}</script>\n"
+        "<script>try{"
+        "var _t=localStorage.getItem('animdb_theme');"
+        "if(_t)document.documentElement.setAttribute('data-theme',_t);"
+        "var _ac=localStorage.getItem('animdb_ac'),_ac2=localStorage.getItem('animdb_ac2');"
+        "if(_ac)document.documentElement.style.setProperty('--ac',_ac);"
+        "if(_ac2)document.documentElement.style.setProperty('--ac2',_ac2);"
+        "}catch(e){}</script>\n"
         "<style>\n"
         ":root{"
-        "--bg:#111318;--sf:#1a1d24;--sf2:#22262f;--bd:#2d3140;"
-        "--ac:#5b8af0;--ac2:#7aa3f5;--tx:#dde2f0;--mu:#7880a0;"
-        "--red:#e05468;--green:#3ecf8e;--tagbg:#1e2d5a;--tagtx:#7aa3f5;"
-        "--lbbg:rgba(0,0,0,.95);"
-        "--r:6px;--fn:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+        "--bg:#17151c;--sf:#1e1c25;--sf2:#28252f;--sf3:#322e3a;--bd:#332f3c;"
+        "--ac:#7c93f5;--ac2:#a6b4fa;--tx:#efecf5;--mu:#9791ac;--mu2:#6b6580;"
+        "--gold:#f0c15c;--red:#f0748a;--green:#5ad9a8;--tagbg:#2a2b52;--tagtx:#a6b4fa;"
+        "--r:10px;--r-lg:18px;--r-pill:999px;"
+        "--fn:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
         "--mo:'SF Mono','Fira Code',monospace;"
         "}\n"
         "[data-theme='light']{"
-        "--bg:#f4f5f8;--sf:#ffffff;--sf2:#eef0f5;--bd:#dde1ea;"
-        "--ac:#3f6fd6;--ac2:#3f6fd6;--tx:#1c2030;--mu:#6b7288;"
-        "--red:#d33a52;--green:#1f9d68;--tagbg:#dbe6ff;--tagtx:#2f5fc7;"
+        "--bg:#f6f3ee;--sf:#ffffff;--sf2:#f1ede6;--sf3:#e8e2d8;--bd:#e2dcd1;"
+        "--ac:#5b6fd6;--ac2:#4757b8;--tx:#2a2620;--mu:#7d7669;--mu2:#a39c8c;"
+        "--gold:#c9932f;--red:#d0405a;--green:#1f9d68;--tagbg:#e2e2fb;--tagtx:#4757b8;"
         "}\n"
         "*{box-sizing:border-box;margin:0;padding:0}\n"
         "body{background:var(--bg);color:var(--tx);font-family:var(--fn);"
@@ -892,8 +1027,9 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         ".logo{font-weight:700;font-size:15px;color:var(--ac2);white-space:nowrap}\n"
         ".logo small{color:var(--mu);font-weight:400;font-size:11px;margin-left:4px}\n"
         ".srch{flex:1;max-width:500px;background:var(--sf2);border:1px solid var(--bd);"
-        "border-radius:var(--r);color:var(--tx);padding:7px 12px;font-size:13px;outline:none}\n"
+        "border-radius:var(--r-pill);color:var(--tx);padding:8px 16px;font-size:13px;outline:none}\n"
         ".srch:focus{border-color:var(--ac)}\n"
+        ".srch::placeholder{color:var(--mu2)}\n"
         ".sel{background:var(--sf2);border:1px solid var(--bd);border-radius:var(--r);"
         "color:var(--tx);padding:5px 8px;font-size:12px;outline:none;cursor:pointer}\n"
         ".sel:focus{border-color:var(--ac)}\n"
@@ -906,13 +1042,31 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
 
         ".shell{display:flex;flex:1;overflow:hidden}\n"
 
-        ".sidebar{width:230px;flex-shrink:0;background:var(--sf);"
+        ".sidebar{width:232px;flex-shrink:0;background:var(--sf);"
         "border-right:1px solid var(--bd);display:flex;flex-direction:column;overflow:hidden}\n"
-        ".stabs{display:flex;border-bottom:1px solid var(--bd);flex-shrink:0}\n"
-        ".stab{flex:1;padding:9px 0;text-align:center;font-size:11px;font-weight:600;"
-        "color:var(--mu);cursor:pointer;border-bottom:2px solid transparent}\n"
-        ".stab.on{color:var(--ac2);border-bottom-color:var(--ac)}\n"
+        ".qviews{display:flex;flex-direction:column;gap:2px;padding:12px 10px 8px;flex-shrink:0}\n"
+        ".qv{display:flex;align-items:center;gap:10px;padding:9px 12px;font-size:13px;"
+        "font-weight:600;color:var(--mu);cursor:pointer;border-radius:var(--r);user-select:none}\n"
+        ".qv .sico{font-size:14px;width:16px;text-align:center;flex-shrink:0}\n"
+        ".qv:hover:not(.on){background:var(--sf2);color:var(--tx)}\n"
+        ".qv.on{color:var(--ac2);background:var(--sf3)}\n"
+        ".qvbadge{margin-left:auto;background:var(--sf3);color:var(--mu2);font-size:10px;"
+        "font-weight:700;border-radius:var(--r-pill);padding:1px 7px}\n"
+        ".qv.on .qvbadge{background:var(--ac);color:#fff}\n"
+        ".stabs{display:flex;flex-direction:column;gap:1px;padding:8px 10px;"
+        "border-top:1px solid var(--bd);border-bottom:1px solid var(--bd);flex-shrink:0}\n"
+        ".stab{display:flex;align-items:center;gap:9px;padding:6px 12px;font-size:11.5px;"
+        "font-weight:600;color:var(--mu2);cursor:pointer;border-radius:var(--r);user-select:none}\n"
+        ".stab .sico{font-size:12px;width:14px;text-align:center;flex-shrink:0}\n"
+        ".stab:hover:not(.on){background:var(--sf2);color:var(--tx)}\n"
+        ".stab.on{color:var(--ac2);background:var(--sf3)}\n"
         ".sbody{overflow-y:auto;flex:1;padding:12px}\n"
+        ".sbsec{font-size:10px;color:var(--mu2);text-transform:uppercase;"
+        "letter-spacing:.6px;font-weight:700;margin:2px 4px 8px}\n"
+        ".sbstats{flex-shrink:0;padding:12px 16px;border-top:1px solid var(--bd);"
+        "background:var(--sf2)}\n"
+        ".sbstatn{font-size:13px;font-weight:700;color:var(--tx)}\n"
+        ".sbstat2{font-size:11px;color:var(--mu);margin-top:1px}\n"
         ".fg{margin-bottom:12px}\n"
         ".fg label{display:block;font-size:11px;color:var(--mu);margin-bottom:4px}\n"
         ".fg select,.fg input[type=text],.fg input[type=date]{"
@@ -925,21 +1079,21 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         ".fbtn:hover{opacity:.85}\n"
         ".fbtn.ghost{background:var(--sf2);color:var(--mu);border:1px solid var(--bd);margin-top:5px}\n"
 
-        ".ftrow{display:flex;align-items:center;gap:4px;padding:4px 6px;"
+        ".ftrow{display:flex;align-items:center;gap:4px;padding:6px 8px;"
         "border-radius:var(--r);cursor:default;font-size:12px;user-select:none}\n"
         ".ftrow:hover{background:var(--sf2)}\n"
-        ".ftrow.on{background:var(--sf2);color:var(--ac2)}\n"
+        ".ftrow.on{background:var(--sf3);color:var(--ac2);font-weight:600}\n"
         ".tgl{width:16px;height:16px;display:flex;align-items:center;justify-content:center;"
         "font-size:9px;color:var(--mu);cursor:pointer;flex-shrink:0;border-radius:3px}\n"
         ".tgl:hover{background:var(--bd);color:var(--tx)}\n"
         ".fn{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}\n"
-        ".fc{font-size:10px;color:var(--mu);flex-shrink:0}\n"
+        ".fc{font-size:10px;color:var(--mu2);flex-shrink:0}\n"
         ".fnew{width:100%;background:none;border:1px dashed var(--bd);border-radius:var(--r);"
         "color:var(--mu);padding:5px;font-size:11px;cursor:pointer;margin-top:6px}\n"
         ".fnew:hover{border-color:var(--ac);color:var(--ac2)}\n"
 
         ".tchip{display:inline-flex;align-items:center;gap:3px;background:var(--tagbg);"
-        "color:var(--tagtx);border-radius:3px;padding:2px 7px;font-size:11px;"
+        "color:var(--tagtx);border-radius:var(--r-pill);padding:2px 9px;font-size:11px;"
         "margin:2px;cursor:pointer}\n"
         ".tchip:hover{opacity:.8}\n"
         ".tchip.on{background:var(--ac);color:#fff}\n"
@@ -961,60 +1115,108 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "font-family:var(--mo);font-size:10px}\n"
         ".mfempty{font-size:11px;color:var(--mu)}\n"
         ".themerow{display:flex;gap:6px;margin-bottom:4px}\n"
-        ".lbswatches{display:flex;gap:8px;align-items:center;flex-wrap:wrap}\n"
-        ".lbswatch{width:24px;height:24px;border-radius:50%;border:2px solid var(--bd);"
+        ".accswatches{display:flex;gap:8px;align-items:center;flex-wrap:wrap}\n"
+        ".accswatch{width:24px;height:24px;border-radius:50%;border:2px solid var(--bd);"
         "cursor:pointer;padding:0}\n"
-        ".lbswatch.on{border-color:var(--ac)}\n"
+        ".accswatch.on{border-color:var(--tx)}\n"
+        ".fbtn.danger{background:var(--red);color:#fff}\n"
+        ".fbtn.danger:hover{opacity:.85}\n"
+        ".setsec h4.danger{color:var(--red)}\n"
 
-        ".content{flex:1;display:flex;flex-direction:column;overflow:hidden}\n"
+        ".content{flex:1;display:flex;flex-direction:column;overflow:hidden;position:relative}\n"
         ".toolbar{padding:8px 16px;background:var(--sf);border-bottom:1px solid var(--bd);"
         "display:flex;align-items:center;gap:10px;flex-shrink:0;flex-wrap:wrap}\n"
-        ".tcnt{font-size:12px;color:var(--mu);flex:1}\n"
+        ".toolspacer{flex:1}\n"
         ".ingpill{font-size:11px;color:var(--ac2);background:var(--sf2);"
         "border:1px solid var(--bd);border-radius:12px;padding:3px 10px;white-space:nowrap}\n"
         ".vbtns{display:flex;gap:3px}\n"
         ".vbtn{background:var(--sf2);border:1px solid var(--bd);border-radius:var(--r);"
         "color:var(--mu);padding:4px 9px;font-size:14px;cursor:pointer}\n"
         ".vbtn.on{background:var(--ac);border-color:var(--ac);color:#fff}\n"
+        ".foldhead{padding:18px 20px 6px;display:flex;align-items:flex-end;"
+        "justify-content:space-between;gap:16px;flex-shrink:0;flex-wrap:wrap}\n"
+        ".foldtitle{font-size:22px;font-weight:800;color:var(--tx)}\n"
+        ".tcnt{font-size:12px;color:var(--mu);margin-top:3px}\n"
+        ".chiprow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-bottom:2px}\n"
+        ".chip{display:inline-flex;align-items:center;gap:5px;background:var(--sf2);"
+        "border:1px solid var(--bd);border-radius:var(--r-pill);color:var(--mu);"
+        "padding:6px 13px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}\n"
+        ".chip:hover{border-color:var(--ac)}\n"
+        ".chip.on{background:var(--tagbg);border-color:var(--tagbg);color:var(--tagtx)}\n"
+        "select.chip{-webkit-appearance:none;appearance:none;outline:none;"
+        "background-image:linear-gradient(45deg,transparent 50%,var(--mu) 50%),"
+        "linear-gradient(135deg,var(--mu) 50%,transparent 50%);"
+        "background-position:calc(100% - 15px) center,calc(100% - 10px) center;"
+        "background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:26px}\n"
+        ".tagchip{background:var(--tagbg);border-color:var(--tagbg);color:var(--tagtx);"
+        "padding:6px 8px 6px 13px}\n"
+        ".tagchip button{background:none;border:none;color:var(--tagtx);cursor:pointer;"
+        "font-size:14px;line-height:1;padding:0 2px;opacity:.75}\n"
+        ".tagchip button:hover{opacity:1}\n"
 
-        ".bulkbar{display:none;background:rgba(91,138,240,.1);"
-        "border-bottom:1px solid rgba(91,138,240,.3);padding:7px 16px;"
-        "align-items:center;gap:10px;font-size:12px;flex-shrink:0}\n"
+        ".bulkbar{display:none;position:absolute;left:50%;bottom:22px;"
+        "transform:translateX(-50%);z-index:30;background:var(--sf2);"
+        "border:1px solid var(--bd);border-radius:var(--r-pill);padding:9px 12px 9px 18px;"
+        "box-shadow:0 16px 40px rgba(0,0,0,.45);align-items:center;gap:6px;"
+        "font-size:12px;max-width:92%}\n"
         ".bulkbar.show{display:flex}\n"
-        ".bulkbar span{flex:1}\n"
-        ".bb{background:var(--sf2);border:1px solid var(--bd);border-radius:var(--r);"
-        "color:var(--tx);padding:4px 11px;font-size:11px;cursor:pointer}\n"
-        ".bb:hover{border-color:var(--ac)}\n"
-        ".bb.red{border-color:rgba(224,84,104,.3);color:var(--red)}\n"
-        ".bb.red:hover{background:var(--red);border-color:var(--red);color:#fff}\n"
+        ".bulkbar>span{font-weight:700;color:var(--tx);margin-right:6px;white-space:nowrap}\n"
+        ".bbdiv{width:1px;height:18px;background:var(--bd);margin:0 4px;flex-shrink:0}\n"
+        ".bb{background:none;border:none;border-radius:var(--r-pill);"
+        "color:var(--mu);padding:6px 12px;font-size:12px;cursor:pointer;white-space:nowrap}\n"
+        ".bb:hover{background:var(--sf3);color:var(--tx)}\n"
+        ".bb.red{color:var(--red)}\n"
+        ".bb.red:hover{background:var(--red);color:#fff}\n"
+        ".bb.close{width:26px;height:26px;border-radius:50%;background:var(--sf3);"
+        "padding:0;display:flex;align-items:center;justify-content:center;"
+        "color:var(--tx);flex-shrink:0;margin-left:2px}\n"
+        ".bb.close:hover{background:var(--bd)}\n"
 
         ".mscroll{overflow-y:auto;flex:1}\n"
-        ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));"
-        "gap:6px;padding:10px}\n"
-        ".card{background:var(--sf);border:1px solid var(--bd);border-radius:var(--r);"
-        "overflow:hidden;cursor:pointer;transition:border-color .12s,transform .1s;position:relative}\n"
+        ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));"
+        "gap:20px;padding:20px}\n"
+        ".card{background:var(--sf);border:1px solid var(--bd);border-radius:var(--r-lg);"
+        "overflow:hidden;cursor:pointer;transition:border-color .12s,transform .1s,box-shadow .12s;"
+        "position:relative}\n"
         ".card:hover{border-color:var(--ac);transform:translateY(-1px)}\n"
-        ".card.sel{border-color:var(--ac);outline:2px solid var(--ac);outline-offset:-1px}\n"
+        ".card.sel{border-color:var(--ac);box-shadow:0 0 0 3px var(--ac)}\n"
         ".thumb{width:100%;aspect-ratio:1;background:var(--sf2);display:flex;"
         "align-items:center;justify-content:center;overflow:hidden;position:relative}\n"
         ".thumb img{width:100%;height:100%;object-fit:cover;display:block}\n"
         ".thumb .ico{font-size:30px;color:var(--mu);display:none}\n"
         ".thumb.thumbfail .ico{display:flex}\n"
         ".thumb.thumbfail img{display:none}\n"
+        ".thumb::after{content:'';position:absolute;inset:0;pointer-events:none;"
+        "background:linear-gradient(180deg,rgba(0,0,0,0) 55%,rgba(0,0,0,.5) 100%);"
+        "opacity:0;transition:opacity .12s}\n"
+        ".card:hover .thumb::after,.card.sel .thumb::after{opacity:1}\n"
         ".lthumb .ico{font-size:14px;color:var(--mu);display:none}\n"
         ".lthumb.thumbfail .ico{display:flex;align-items:center;justify-content:center;width:100%;height:100%}\n"
         ".lthumb.thumbfail img{display:none}\n"
-        ".pill{position:absolute;border-radius:3px;padding:1px 5px;font-size:9px}\n"
-        ".tpill{top:4px;right:4px;background:rgba(0,0,0,.65);font-family:var(--mo);color:var(--ac2)}\n"
-        ".dpill{top:4px;left:4px;background:var(--red);font-weight:700;color:#fff}\n"
-        ".vrpill{bottom:4px;right:4px;background:rgba(0,0,0,.65);color:#fff}\n"
+        ".pill{position:absolute;border-radius:5px;padding:1px 5px;font-size:9px;z-index:2}\n"
+        ".tpill{bottom:6px;left:6px;background:rgba(0,0,0,.6);font-family:var(--mo);color:#fff}\n"
+        ".dpill{top:8px;left:50%;transform:translateX(-50%);background:var(--red);"
+        "font-weight:700;color:#fff}\n"
+        ".vrpill{bottom:6px;right:6px;background:rgba(0,0,0,.6);color:#fff}\n"
+        ".playico{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);"
+        "width:44px;height:44px;border-radius:50%;background:rgba(0,0,0,.5);"
+        "color:#fff;display:flex;align-items:center;justify-content:center;"
+        "font-size:16px;pointer-events:none;z-index:1}\n"
+        ".selchip{position:absolute;top:8px;left:8px;width:22px;height:22px;border-radius:7px;"
+        "background:rgba(255,255,255,.16);backdrop-filter:blur(3px);border:1.5px solid rgba(255,255,255,.55);"
+        "color:#fff;font-size:12px;line-height:1;cursor:pointer;opacity:0;transition:opacity .12s,background .12s;"
+        "display:flex;align-items:center;justify-content:center;z-index:3}\n"
+        ".card:hover .selchip,.card.sel .selchip{opacity:1}\n"
+        ".selchip.on{background:var(--ac);border-color:var(--ac)}\n"
         ".favbtn{border:none;cursor:pointer;line-height:1}\n"
-        ".favbtn.cardfav{position:absolute;bottom:4px;left:4px;background:rgba(0,0,0,.55);"
-        "color:#fff;font-size:14px;padding:2px 5px;border-radius:3px;opacity:.85}\n"
-        ".favbtn.cardfav:hover{opacity:1}\n"
-        ".favbtn.cardfav.on{color:#ffce45;opacity:1}\n"
+        ".favbtn.cardfav{position:absolute;top:8px;right:8px;width:22px;height:22px;"
+        "border-radius:50%;background:rgba(255,255,255,.16);backdrop-filter:blur(3px);"
+        "color:#fff;font-size:13px;display:flex;align-items:center;justify-content:center;"
+        "opacity:0;transition:opacity .12s;z-index:3}\n"
+        ".card:hover .favbtn.cardfav,.favbtn.cardfav.on{opacity:1}\n"
+        ".favbtn.cardfav.on{color:var(--gold)}\n"
         ".favbtn.listfav{background:none;color:var(--mu);font-size:15px;padding:2px}\n"
-        ".favbtn.listfav.on{color:#ffce45}\n"
+        ".favbtn.listfav.on{color:var(--gold)}\n"
         ".cfoot{padding:5px 7px}\n"
         ".cname{font-size:10px;font-weight:500;white-space:nowrap;overflow:hidden;"
         "text-overflow:ellipsis;margin-bottom:1px}\n"
@@ -1045,32 +1247,45 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         ".empty{text-align:center;padding:60px 20px;color:var(--mu)}\n"
         ".eico{font-size:44px;margin-bottom:10px}\n"
 
-        ".lbox{position:fixed;inset:0;background:var(--lbbg);z-index:200;"
+        ".lbox{position:fixed;inset:0;background:#0a090d;z-index:200;"
         "display:none;flex-direction:column}\n"
         ".lbox.open{display:flex}\n"
-        ".lbtop{position:relative;z-index:10;display:flex;align-items:center;padding:9px 14px;gap:10px;"
-        "background:rgba(0,0,0,.5);flex-shrink:0}\n"
-        ".lbtitle{font-size:13px;font-weight:600;flex:1;overflow:hidden;"
+        ".lbpillleft{position:absolute;top:20px;left:20px;z-index:15;display:flex;"
+        "align-items:center;gap:8px;background:rgba(30,28,37,.78);backdrop-filter:blur(10px);"
+        "border-radius:var(--r-pill);padding:6px 16px 6px 6px;max-width:60vw}\n"
+        ".lbpillright{position:absolute;top:20px;right:20px;z-index:15;display:flex;gap:8px}\n"
+        ".lbtitle{font-size:13px;font-weight:600;color:#fff;overflow:hidden;"
         "text-overflow:ellipsis;white-space:nowrap}\n"
-        ".lbacts{display:flex;gap:6px}\n"
-        ".lbtn{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.15);"
-        "border-radius:var(--r);color:#fff;padding:5px 11px;font-size:12px;cursor:pointer}\n"
-        ".lbtn:hover{background:rgba(255,255,255,.2)}\n"
-        ".lbtn.active{color:#ffce45;border-color:#ffce45}\n"
+        ".lbcircle{width:32px;height:32px;border-radius:50%;background:rgba(255,255,255,.14);"
+        "border:none;color:#fff;font-size:14px;cursor:pointer;display:flex;align-items:center;"
+        "justify-content:center;flex-shrink:0}\n"
+        ".lbcircle:hover{background:rgba(255,255,255,.24)}\n"
+        ".lbcircle.active{background:var(--ac);color:#fff}\n"
+        ".lbpillright .lbcircle{width:38px;height:38px;font-size:15px;"
+        "background:rgba(30,28,37,.78);backdrop-filter:blur(10px)}\n"
+        ".lbpillright .lbcircle:hover{background:rgba(50,46,58,.9)}\n"
         ".lbmain{flex:1;display:flex;align-items:stretch;justify-content:center;"
-        "overflow:hidden;position:relative}\n"
-        ".lbmain img{width:calc(100% - 100px);height:100%;object-fit:contain;display:block;"
+        "overflow:hidden;position:relative;padding:40px}\n"
+        ".lbmain img{width:100%;height:100%;object-fit:contain;display:block;border-radius:var(--r-lg);"
         "cursor:zoom-in;transition:transform .05s linear;user-select:none;-webkit-user-drag:none}\n"
-        ".lbmain video{max-width:calc(100% - 100px);max-height:100%;display:block;outline:none;z-index:1}\n"
-        ".lbnav{position:absolute;top:50%;transform:translateY(-50%);"
-        "background:rgba(0,0,0,.45);border:none;color:#fff;font-size:24px;"
-        "padding:14px 8px;cursor:pointer;border-radius:var(--r);opacity:.6;z-index:10}\n"
-        ".lbnav.p{left:10px}\n"
-        ".lbnav.n{right:10px}\n"
-        ".lbzoom{display:flex;align-items:center;gap:4px}\n"
+        ".lbmain video{max-width:100%;max-height:100%;display:block;outline:none;z-index:1;"
+        "border-radius:var(--r-lg)}\n"
+        ".lbnav{position:absolute;top:50%;transform:translateY(-50%);width:48px;height:48px;"
+        "background:rgba(255,255,255,.14);border:none;color:#fff;font-size:22px;"
+        "cursor:pointer;border-radius:50%;display:flex;align-items:center;justify-content:center;"
+        "z-index:10}\n"
+        ".lbnav:hover{background:rgba(255,255,255,.24)}\n"
+        ".lbnav.p{left:20px}\n"
+        ".lbnav.n{right:20px}\n"
+        ".lbzoom{position:absolute;left:50%;bottom:20px;transform:translateX(-50%);z-index:15;"
+        "display:flex;align-items:center;gap:2px;background:rgba(30,28,37,.78);"
+        "backdrop-filter:blur(10px);border-radius:var(--r-pill);padding:6px 8px}\n"
+        ".lbtn{background:none;border:none;color:#fff;padding:5px 10px;font-size:13px;"
+        "cursor:pointer;border-radius:var(--r-pill)}\n"
+        ".lbtn:hover{background:rgba(255,255,255,.14)}\n"
         ".lbzpct{min-width:46px;text-align:center}\n"
 
-        ".lbinfo{position:absolute;right:0;top:47px;bottom:0;width:310px;z-index:20;"
+        ".lbinfo{position:absolute;right:0;top:0;bottom:0;width:300px;z-index:20;"
         "background:var(--sf);border-left:1px solid var(--bd);overflow-y:auto;"
         "transform:translateX(100%);transition:transform .2s ease;display:flex;flex-direction:column}\n"
         ".lbinfo.open{transform:translateX(0)}\n"
@@ -1085,8 +1300,8 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         ".mrow span:last-child{font-family:var(--mo);font-size:10px;max-width:170px;"
         "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}\n"
         ".taglist{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}\n"
-        ".tpill2{background:var(--tagbg);color:var(--tagtx);border-radius:3px;"
-        "padding:2px 7px;font-size:11px;display:flex;align-items:center;gap:3px}\n"
+        ".tpill2{background:var(--tagbg);color:var(--tagtx);border-radius:var(--r-pill);"
+        "padding:2px 9px;font-size:11px;display:flex;align-items:center;gap:3px}\n"
         ".tpill2 button{background:none;border:none;color:var(--tagtx);"
         "cursor:pointer;font-size:12px;line-height:1;padding:0}\n"
         ".tpill2 button:hover{color:var(--red)}\n"
@@ -1139,6 +1354,19 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         ".dlg input{width:100%;background:var(--sf2);border:1px solid var(--bd);"
         "border-radius:var(--r);color:var(--tx);padding:7px 9px;font-size:12px;outline:none}\n"
         ".dlg input:focus{border-color:var(--ac)}\n"
+        ".dlg input[type=checkbox]{width:14px;height:14px;flex:none;padding:0;"
+        "margin:0;accent-color:var(--ac);cursor:pointer}\n"
+        ".dlg label.chk{display:flex;align-items:center;gap:7px;font-size:12px;"
+        "cursor:pointer;width:100%}\n"
+        ".dlg .browserow{display:flex;gap:7px;align-items:center;margin-bottom:9px}\n"
+        ".dlg .browserow input{margin-bottom:0}\n"
+        ".browsebtn{flex:none;background:var(--sf2);border:1px solid var(--bd);"
+        "border-radius:var(--r);color:var(--tx);padding:7px 12px;font-size:12px;cursor:pointer;"
+        "white-space:nowrap}\n"
+        ".browsebtn:hover{border-color:var(--ac)}\n"
+        ".fpick .browsebtn{width:100%;text-align:center;padding:10px 12px;margin-bottom:12px;"
+        "background:var(--ac);border-color:var(--ac);color:#fff;font-weight:600}\n"
+        ".fpick .browsebtn:hover{opacity:.9}\n"
         ".dlgact{display:flex;gap:8px;justify-content:flex-end}\n"
         ".dlgact button{background:var(--sf2);border:1px solid var(--bd);"
         "border-radius:var(--r);color:var(--tx);padding:6px 14px;font-size:12px;cursor:pointer}\n"
@@ -1171,6 +1399,9 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         ".dupitem button.keepbtn:hover{background:var(--green);color:#0a0a0a}\n"
         ".dupitem button.delbtn{border-color:var(--red);color:var(--red)}\n"
         ".dupitem button.delbtn:hover{background:var(--red);color:#fff}\n"
+        ".dupdelallbtn{font-size:12px;padding:6px 12px;border-radius:var(--r);"
+        "border:1px solid var(--red);background:none;color:var(--red);cursor:pointer}\n"
+        ".dupdelallbtn:hover{background:var(--red);color:#fff}\n"
 
         ".toastwrap{position:fixed;bottom:18px;right:18px;display:flex;"
         "flex-direction:column;gap:5px;z-index:500}\n"
@@ -1196,18 +1427,17 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  <div style='position:relative'>\n"
         "    <button class='icoBtn' id='filterBtn' onclick='toggleFilterMenu(event)'>&#9660; Filters</button>\n"
         "    <div class='filtmenu' id='filtmenu' style='display:none'>\n"
-        "      <div class='fg'><label>Media type</label>\n"
-        "        <select id='fType' onchange='goPage(0)'>\n"
-        "          <option value=''>All</option>\n"
-        "          <option value='image'>Images</option>\n"
-        "          <option value='video'>Videos</option>\n"
-        "        </select></div>\n"
+        "      <select id='fType' style='display:none' onchange='goPage(0)'>\n"
+        "        <option value=''>All</option>\n"
+        "        <option value='image'>Images</option>\n"
+        "        <option value='video'>Videos</option>\n"
+        "      </select>\n"
+        "      <input type='checkbox' id='fFav' style='display:none' />\n"
         "      <div class='fg'><label>Date taken from</label><input type='date' id='fFrom'/></div>\n"
         "      <div class='fg'><label>Date taken to</label><input type='date' id='fTo'/></div>\n"
         "      <div class='fg'><label>Extension</label><input type='text' id='fExt' placeholder='jpg, mp4&#8230;'/></div>\n"
         "      <div class='fg'><label>Tags (space-separated)</label><input type='text' id='fTags' placeholder='vacation beach'/></div>\n"
         "      <div class='fg'><label class='chk'><input type='checkbox' id='fDupes'/> Duplicates only</label></div>\n"
-        "      <div class='fg'><label class='chk'><input type='checkbox' id='fFav'/> Favorites only</label></div>\n"
         "      <button class='fbtn' onclick='goPage(0);closeFilterMenu()'>Apply</button>\n"
         "      <button class='fbtn ghost' onclick='clearFilters()'>Clear</button>\n"
         "    </div>\n"
@@ -1222,14 +1452,25 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "</div>\n"
         "<div class='shell'>\n"
         "<div class='sidebar'>\n"
+        "  <div class='qviews'>\n"
+        "    <div class='qv on' id='qv-all' onclick=\"quickView('all')\">"
+        "<span class='sico'>&#128247;</span>All Media</div>\n"
+        "    <div class='qv' id='qv-fav' onclick=\"quickView('fav')\">"
+        "<span class='sico'>&#9733;</span>Favorites</div>\n"
+        "    <div class='qv' id='qv-dup' onclick=\"quickView('dup')\">"
+        "<span class='sico'>&#8916;</span>Duplicates<span class='qvbadge' id='qvdupbadge'>0</span></div>\n"
+        "    <div class='qv' id='qv-recent' onclick=\"quickView('recent')\">"
+        "<span class='sico'>&#128337;</span>Recently Added</div>\n"
+        "  </div>\n"
         "  <div class='stabs'>\n"
-        "    <div class='stab on' onclick=\"showSB('folders')\">Folders</div>\n"
-        "    <div class='stab' onclick=\"showSB('tags')\">Tags</div>\n"
-        "    <div class='stab' onclick=\"showSB('stats')\">Stats</div>\n"
-        "    <div class='stab' onclick=\"showSB('settings')\">Settings</div>\n"
+        "    <div class='stab on' onclick=\"showSB('folders')\"><span class='sico'>&#128193;</span>Folders</div>\n"
+        "    <div class='stab' onclick=\"showSB('tags')\"><span class='sico'>&#127991;&#65039;</span>Tags</div>\n"
+        "    <div class='stab' onclick=\"showSB('stats')\"><span class='sico'>&#128202;</span>Stats</div>\n"
+        "    <div class='stab' onclick=\"showSB('settings')\"><span class='sico'>&#9881;&#65039;</span>Settings</div>\n"
         "  </div>\n"
         "  <div class='sbody'>\n"
         "    <div id='sb-folders'>\n"
+        "      <div class='sbsec'>Folders</div>\n"
         "      <div id='ftree'></div>\n"
         "      <button class='fnew' onclick='newFolder(null)'>+ New root folder</button>\n"
         "    </div>\n"
@@ -1237,11 +1478,15 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "    <div id='sb-stats' style='display:none'><div id='statpanel'></div></div>\n"
         "    <div id='sb-settings' style='display:none'><div id='settingspanel'></div></div>\n"
         "  </div>\n"
+        "  <div class='sbstats'>\n"
+        "    <div class='sbstatn' id='sbstatn'>&#8211;</div>\n"
+        "    <div class='sbstat2' id='sbstat2'>&nbsp;</div>\n"
+        "  </div>\n"
         "</div>\n"
         "<div class='content'>\n"
         "  <div class='toolbar'>\n"
-        "    <span class='tcnt' id='tcnt'>&#8211;</span>\n"
         "    <span class='ingpill' id='ingpill' style='display:none'></span>\n"
+        "    <div class='toolspacer'></div>\n"
         "    <button class='icoBtn' onclick='rescanIngest()' "
         "title='Scan a folder on disk for new or changed media'>&#8635; Rescan / Ingest&#8230;</button>\n"
         "    <div class='vbtns'>\n"
@@ -1249,13 +1494,29 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "      <button class='vbtn' id='vl' onclick=\"setView('list')\">&#9776;</button>\n"
         "    </div>\n"
         "  </div>\n"
+        "  <div class='foldhead'>\n"
+        "    <div class='foldheadtext'>\n"
+        "      <h2 class='foldtitle' id='foldtitle'>All Media</h2>\n"
+        "      <div class='tcnt' id='tcnt'>&#8211;</div>\n"
+        "    </div>\n"
+        "    <div class='chiprow'>\n"
+        "      <select class='chip' id='chipType' onchange='chipTypeChanged()'>\n"
+        "        <option value=''>All types</option>\n"
+        "        <option value='image'>Images</option>\n"
+        "        <option value='video'>Videos</option>\n"
+        "      </select>\n"
+        "      <button class='chip' id='chipFav' onclick='toggleFavChip()'>&#9733; Favorites</button>\n"
+        "      <span id='chipTags'></span>\n"
+        "    </div>\n"
+        "  </div>\n"
         "  <div class='bulkbar' id='bulkbar'>\n"
         "    <span id='bkcnt'>0 selected</span>\n"
-        "    <button class='bb' onclick='selectAll()'>&#9745; Select All</button>\n"
-        "    <button class='bb' onclick='bulkTag()'>&#127991;&#65039; Tag&#8230;</button>\n"
-        "    <button class='bb' onclick='bulkMove()'>&#128193; Move&#8230;</button>\n"
+        "    <div class='bbdiv'></div>\n"
+        "    <button class='bb' onclick='selectAll()' title='Select all on this page'>&#9745; All</button>\n"
+        "    <button class='bb' onclick='bulkTag()'>&#127991;&#65039; Tag</button>\n"
+        "    <button class='bb' onclick='bulkMove()'>&#128193; Move</button>\n"
         "    <button class='bb red' onclick='bulkDelete()'>&#128465; Delete</button>\n"
-        "    <button class='bb' onclick='clearSel()'>&#x2715; Clear</button>\n"
+        "    <button class='bb close' onclick='clearSel()' title='Clear selection'>&#x2715;</button>\n"
         "  </div>\n"
         "  <div class='mscroll' id='mscroll'><div class='grid' id='mgrid'></div></div>\n"
         "  <div class='pager' id='pager'></div>\n"
@@ -1263,26 +1524,24 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "</div>\n"
         "<!-- LIGHTBOX -->\n"
         "<div class='lbox' id='lbox'>\n"
-        "  <div class='lbtop'>\n"
+        "  <div class='lbpillleft'>\n"
+        "    <button class='lbcircle' onclick='closeLb()' title='Close'>&#x2715;</button>\n"
         "    <span class='lbtitle' id='lbtitle'>&nbsp;</span>\n"
-        "    <div class='lbzoom' id='lbzoom' style='display:none'>\n"
-        "      <button class='lbtn' onclick='lbZoomBy(-0.25)' title='Zoom out'>&#8722;</button>\n"
-        "      <button class='lbtn lbzpct' id='lbzoompct' onclick='lbZoomReset()' title='Reset zoom'>100%</button>\n"
-        "      <button class='lbtn' onclick='lbZoomBy(0.25)' title='Zoom in'>&#43;</button>\n"
-        "    </div>\n"
-        "    <div class='lbacts'>\n"
-        "      <button class='lbtn' id='lbfav' onclick='toggleFavCurrent()'>&#9734; Favorite</button>\n"
-        "      <button class='lbtn' id='lbslide' onclick='toggleSlideshow()'>&#9654; Slideshow</button>\n"
-        "      <button class='lbtn' onclick='toggleInfo()'>&#9432; Info</button>\n"
-        "      <button class='lbtn' onclick='lbNav(-1)'>&#9664; Prev</button>\n"
-        "      <button class='lbtn' onclick='lbNav(1)'>Next &#9654;</button>\n"
-        "      <button class='lbtn' onclick='closeLb()'>&#x2715; Close</button>\n"
-        "    </div>\n"
+        "  </div>\n"
+        "  <div class='lbpillright'>\n"
+        "    <button class='lbcircle' id='lbfav' onclick='toggleFavCurrent()' title='Favorite'>&#9734;</button>\n"
+        "    <button class='lbcircle' id='lbslide' onclick='toggleSlideshow()' title='Slideshow'>&#9654;</button>\n"
+        "    <button class='lbcircle' onclick='toggleInfo()' title='Info'>&#9432;</button>\n"
         "  </div>\n"
         "  <div class='lbmain' id='lbmain' onclick='lbMainClick(event)'>\n"
         "    <button class='lbnav p' onclick='lbNav(-1)'>&#8249;</button>\n"
         "    <div id='lbmedia' style='display:flex;align-items:center;justify-content:center;flex:1;max-height:100%;overflow:hidden'></div>\n"
         "    <button class='lbnav n' onclick='lbNav(1)'>&#8250;</button>\n"
+        "  </div>\n"
+        "  <div class='lbzoom' id='lbzoom' style='display:none'>\n"
+        "    <button class='lbtn' onclick='lbZoomBy(-0.25)' title='Zoom out'>&#8722;</button>\n"
+        "    <button class='lbtn lbzpct' id='lbzoompct' onclick='lbZoomReset()' title='Reset zoom'>100%</button>\n"
+        "    <button class='lbtn' onclick='lbZoomBy(0.25)' title='Zoom in'>&#43;</button>\n"
         "  </div>\n"
         "  <div class='lbinfo' id='lbinfo'>\n"
         "    <div class='ihead'>\n"
@@ -1297,6 +1556,8 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  <div class='fpick'>\n"
         "    <h1>Select a folder</h1>\n"
         "    <p>Choose which folder to view. Its subfolders are included automatically.</p>\n"
+        "    <button type='button' class='browsebtn' id='fpickbrowsebtn' style='display:none' "
+        "onclick='browseAndIngestAtStartup()'>&#128193; Browse for a folder to add&#8230;</button>\n"
         "    <div id='fpicklist' class='fpicklist'></div>\n"
         "    <div id='fpickempty' class='fpickempty'>No folders yet &#8212; "
         "<a href='#' onclick='skipFolderPicker();return false;'>view all media instead</a>.</div>\n"
@@ -1320,7 +1581,11 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  <div class='dupdlg'>\n"
         "    <div class='duphead'>\n"
         "      <h3>Duplicate Files</h3>\n"
-        "      <button class='iclose' onclick='closeDupes()'>&#x2715;</button>\n"
+        "      <div style='display:flex;gap:8px;align-items:center'>\n"
+        "        <button class='dupdelallbtn' id='dupdelallbtn' style='display:none' "
+        "onclick='deleteAllDuplicates()'>Delete All Duplicates</button>\n"
+        "        <button class='iclose' onclick='closeDupes()'>&#x2715;</button>\n"
+        "      </div>\n"
         "    </div>\n"
         "    <div class='dupbody' id='dupbody'></div>\n"
         "  </div>\n"
@@ -1329,10 +1594,24 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "<script>\n"
         "var page=0,sortDir='desc',view='grid',activeFolder=null;\n"
         "var results=[],totalCount=0,lbIdx=0,sel=new Set(),dlgCb=null;\n"
+        "var currentQuickView='all';\n"
         "var lbZoom=1,lbPanX=0,lbPanY=0,lbDragging=false,lbDragSX=0,lbDragSY=0,lbJustDragged=false;\n"
         "var collapsed={};\n"
         "function g(id){return document.getElementById(id);}\n"
         "function dbt(fn){var t;return function(){clearTimeout(t);t=setTimeout(fn,280);}}\n"
+        "var _pywebviewReady=new Promise(function(resolve){\n"
+        "  if(window.pywebview&&window.pywebview.api){resolve();return;}\n"
+        "  document.addEventListener('pywebviewready',resolve);\n"
+        "  setTimeout(resolve,1200);\n"
+        "});\n"
+        "function isDesktopApp(){\n"
+        "  return !!(window.pywebview&&window.pywebview.api&&window.pywebview.api.browse_folder);\n"
+        "}\n"
+        "async function nativeBrowseFolder(){\n"
+        "  await _pywebviewReady;\n"
+        "  if(!isDesktopApp())return null;\n"
+        "  try{return await window.pywebview.api.browse_folder();}catch(e){return null;}\n"
+        "}\n"
         "async function api(path,method,body){\n"
         "  method=method||'GET';\n"
         "  var opts={method:method,headers:{'Content-Type':'application/json'}};\n"
@@ -1348,7 +1627,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "    .replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');\n"
         "}\n"
         "function fmtSz(n){\n"
-        "  if(!n)return'&#8211;';\n"
+        "  if(!n)return'\\u2013';\n"
         "  var u=['B','KB','MB','GB'],i=0;\n"
         "  while(n>=1024&&i<3){n/=1024;i++;}\n"
         "  return n.toFixed(1)+' '+u[i];\n"
@@ -1393,6 +1672,63 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  if(name==='settings')loadSettings();\n"
         "}\n"
 
+        "function quickView(which){\n"
+        "  currentQuickView=which;\n"
+        "  activeFolder=null;\n"
+        "  document.querySelectorAll('.qv').forEach(function(el){el.classList.remove('on');});\n"
+        "  var el=g('qv-'+which);if(el)el.classList.add('on');\n"
+        "  g('fFav').checked=(which==='fav');\n"
+        "  g('fDupes').checked=(which==='dup');\n"
+        "  if(which==='recent'){g('sortBy').value='date_added';sortDir='desc';"
+        "g('dirBtn').innerHTML='&#8595;';}\n"
+        "  page=0;loadMedia();\n"
+        "}\n"
+        "function clearQuickView(){\n"
+        "  currentQuickView='all';\n"
+        "  document.querySelectorAll('.qv').forEach(function(el){el.classList.remove('on');});\n"
+        "  var el=g('qv-all');if(el)el.classList.add('on');\n"
+        "}\n"
+        "function updateFoldHead(){\n"
+        "  var t='All Media';\n"
+        "  if(currentQuickView==='fav')t='Favorites';\n"
+        "  else if(currentQuickView==='dup')t='Duplicates';\n"
+        "  else if(currentQuickView==='recent')t='Recently Added';\n"
+        "  if(activeFolder!==null&&window._folderFlat){\n"
+        "    var f=window._folderFlat.find(function(x){return x.id===activeFolder;});\n"
+        "    if(f)t=f.name;\n"
+        "  }\n"
+        "  var ft=g('foldtitle');if(ft)ft.textContent=t;\n"
+        "  var ct=g('chipType');if(ct)ct.value=g('fType').value;\n"
+        "  var cf=g('chipFav');if(cf)cf.classList.toggle('on',g('fFav').checked);\n"
+        "}\n"
+        "function chipTypeChanged(){\n"
+        "  g('fType').value=g('chipType').value;\n"
+        "  goPage(0);\n"
+        "}\n"
+        "function toggleFavChip(){\n"
+        "  g('fFav').checked=!g('fFav').checked;\n"
+        "  if(!g('fFav').checked&&currentQuickView==='fav')clearQuickView();\n"
+        "  goPage(0);\n"
+        "}\n"
+        "function renderActiveTagChips(){\n"
+        "  var box=g('chipTags');if(!box)return;\n"
+        "  var raw=g('fTags').value.trim();\n"
+        "  var tags=raw?raw.split(/\\s+/):[];\n"
+        "  box.innerHTML=tags.map(function(t){\n"
+        "    return '<span class=\"chip tagchip\">'+esc(t)+"
+        "'<button type=\"button\" data-tag=\"'+esc(t)+'\" title=\"Remove\">&#x2715;</button></span>';\n"
+        "  }).join('');\n"
+        "}\n"
+        "document.addEventListener('click',function(e){\n"
+        "  var btn=e.target.closest && e.target.closest('#chipTags button[data-tag]');\n"
+        "  if(!btn)return;\n"
+        "  var tag=btn.getAttribute('data-tag');\n"
+        "  var raw=g('fTags').value.trim();\n"
+        "  var tags=raw?raw.split(/\\s+/):[];\n"
+        "  tags=tags.filter(function(t){return t!==tag;});\n"
+        "  g('fTags').value=tags.join(' ');\n"
+        "  goPage(0);\n"
+        "});\n"
         "var loadGen=0;\n"
         "async function loadMedia(){\n"
         "  var myGen=++loadGen;\n"
@@ -1414,7 +1750,18 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  if(myGen!==loadGen)return;\n"
         "  results=data.results;\n"
         "  totalCount=data.total;\n"
-        "  g('tcnt').textContent=totalCount+' file'+(totalCount!==1?'s':'');\n"
+        "  var tcntExtra='';\n"
+        "  if(activeFolder!==null&&window._folderFlat){\n"
+        "    var fmeta=window._folderFlat.find(function(x){return x.id===activeFolder;});\n"
+        "    if(fmeta){\n"
+        "      tcntExtra=' \\u00b7 '+fmtSz(fmeta.media_size||0);\n"
+        "      if(fmeta.child_count)tcntExtra+=' \\u00b7 includes '+fmeta.child_count"
+        "+' subfolder'+(fmeta.child_count!==1?'s':'');\n"
+        "    }\n"
+        "  }\n"
+        "  g('tcnt').textContent=totalCount+' file'+(totalCount!==1?'s':'')+tcntExtra;\n"
+        "  updateFoldHead();\n"
+        "  renderActiveTagChips();\n"
         "  renderMedia();\n"
         "  renderPager();\n"
         "  saveUIState();\n"
@@ -1480,12 +1827,18 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  var dup=m.is_dup?'<div class=\"pill dpill\">DUP</div>':'';\n"
         "  var dur=m.duration?'<div class=\"pill vrpill\">'+fmtDur(m.duration)+'</div>':'';\n"
         "  var tags=m.tags?m.tags.split(', ').map(function(t){return'<span class=\"tchip\">'+esc(t)+'</span>';}).join(''):'';\n"
-        "  var sc=sel.has(m.id)?' sel':'';\n"
+        "  var isSel=sel.has(m.id);\n"
+        "  var sc=isSel?' sel':'';\n"
         "  var ico=m.media_type==='image'?'&#128444;':'&#127909;';\n"
         "  var th='<img src=\"/thumb/'+m.id+'\" loading=\"lazy\" onerror=\"thumbErr(this)\" />"
         "<div class=\"ico\">'+ico+'</div>';\n"
+        "  var playico=m.media_type==='video'?'<div class=\"playico\">&#9654;</div>':'';\n"
+        "  var selchip='<button class=\"selchip'+(isSel?' on':'')+'\" "
+        "onclick=\"toggleSel(event,'+m.id+','+i+')\" title=\"Select\">'+(isSel?'&#10003;':'')+'</button>';\n"
         "  return '<div class=\"card'+sc+'\" onclick=\"cc(event,'+i+')\" data-id=\"'+m.id+'\">'\n"
         "    +'<div class=\"thumb\">'+th\n"
+        "    +playico\n"
+        "    +selchip\n"
         "    +'<div class=\"pill tpill\">.'+esc(m.extension)+'</div>'\n"
         "    +dup+dur+favBtnHTML(m,i,'cardfav')+'</div>'\n"
         "    +'<div class=\"cfoot\">'\n"
@@ -1493,6 +1846,11 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "    +'<div class=\"csub\">'+fmtSz(m.file_size)+(date?' &middot; '+date:'')+'</div>'\n"
         "    +(tags?'<div class=\"ctags\">'+tags+'</div>':'')\n"
         "    +'</div></div>';\n"
+        "}\n"
+        "function toggleSel(e,mid,i){\n"
+        "  e.stopPropagation();\n"
+        "  if(sel.has(mid))sel.delete(mid);else sel.add(mid);\n"
+        "  updBulk();renderMedia();\n"
         "}\n"
         "function listHTML(){\n"
         "  var hdr='<div class=\"lrow\" style=\"cursor:default;pointer-events:none;opacity:.4;font-size:10px\">'\n"
@@ -1565,6 +1923,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  g('fFav').checked=false;\n"
         "  g('q').value='';\n"
         "  activeFolder=null;\n"
+        "  clearQuickView();\n"
         "  document.querySelectorAll('.ftrow').forEach(function(el){el.classList.remove('on');});\n"
         "  goPage(0);\n"
         "}\n"
@@ -1655,7 +2014,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "function updateLbFavBtn(){\n"
         "  var m=results[lbIdx];var btn=g('lbfav');\n"
         "  if(!m||!btn)return;\n"
-        "  btn.innerHTML=(m.is_favorite?'&#9733;':'&#9734;')+' Favorite';\n"
+        "  btn.innerHTML=m.is_favorite?'&#9733;':'&#9734;';\n"
         "  btn.classList.toggle('active',!!m.is_favorite);\n"
         "}\n"
         "async function toggleFavCurrent(){\n"
@@ -1677,12 +2036,12 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "    lbNav(1);\n"
         "  },4000);\n"
         "  var b=g('lbslide');\n"
-        "  if(b){b.innerHTML='&#10074;&#10074; Slideshow';b.classList.add('active');}\n"
+        "  if(b){b.innerHTML='&#10074;&#10074;';b.classList.add('active');b.title='Stop slideshow';}\n"
         "}\n"
         "function stopSlideshow(){\n"
         "  if(slideTimer){clearInterval(slideTimer);slideTimer=null;}\n"
         "  var b=g('lbslide');\n"
-        "  if(b){b.innerHTML='&#9654; Slideshow';b.classList.remove('active');}\n"
+        "  if(b){b.innerHTML='&#9654;';b.classList.remove('active');b.title='Slideshow';}\n"
         "}\n"
         "function updateLbZoom(){\n"
         "  var img=g('lbmedia').querySelector('img');\n"
@@ -1768,10 +2127,10 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  var meta=[\n"
         "    ['Name',data.file_name],['Type',data.media_type+' (.'+data.extension+')'],\n"
         "    ['Size',fmtSz(data.file_size)],\n"
-        "    ['Dimensions',data.width?data.width+' x '+data.height+' px':'&#8211;'],\n"
-        "    ['Date taken',data.date_taken?data.date_taken.slice(0,10):'&#8211;'],\n"
-        "    ['Date added',data.date_added?data.date_added.slice(0,10):'&#8211;'],\n"
-        "    ['Duration',data.duration?fmtDur(data.duration):'&#8211;'],\n"
+        "    ['Dimensions',data.width?data.width+' x '+data.height+' px':'\\u2013'],\n"
+        "    ['Date taken',data.date_taken?data.date_taken.slice(0,10):'\\u2013'],\n"
+        "    ['Date added',data.date_added?data.date_added.slice(0,10):'\\u2013'],\n"
+        "    ['Duration',data.duration?fmtDur(data.duration):'\\u2013'],\n"
         "    ['Path',data.file_path]\n"
         "  ];\n"
         "  var mrows=meta.map(function(kv){\n"
@@ -1839,10 +2198,12 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
 
         "async function loadTree(){\n"
         "  var flat=await api('/folders?tree=1');\n"
+        "  window._folderFlat=flat;\n"
         "  flat.forEach(function(f){\n"
         "    if(f.child_count>0&&!(f.id in collapsed))collapsed[f.id]=true;\n"
         "  });\n"
         "  renderTree(flat);\n"
+        "  updateFoldHead();\n"
         "}\n"
         "function renderTree(flat){\n"
         "  var el=g('ftree');\n"
@@ -1889,6 +2250,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "}\n"
         "function selFolder(fid){\n"
         "  activeFolder=activeFolder===fid?null:fid;\n"
+        "  if(activeFolder!==null)clearQuickView();\n"
         "  cancelThumbs();\n"
         "  loadTree();goPage(0);\n"
         "}\n"
@@ -1896,6 +2258,9 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  var scr=g('mscroll');if(scr)scr.innerHTML='';\n"
         "}\n"
         "async function showFolderPicker(){\n"
+        "  _pywebviewReady.then(function(){\n"
+        "    g('fpickbrowsebtn').style.display=isDesktopApp()?'':'none';\n"
+        "  });\n"
         "  var flat=await api('/folders?tree=1');\n"
         "  if(!flat.length){\n"
         "    g('fpicklist').style.display='none';\n"
@@ -1915,6 +2280,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "}\n"
         "function pickFolder(fid){\n"
         "  activeFolder=fid;\n"
+        "  clearQuickView();\n"
         "  cancelThumbs();\n"
         "  g('fpickbg').classList.remove('open');\n"
         "  loadTree();goPage(0);\n"
@@ -1924,6 +2290,14 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  cancelThumbs();\n"
         "  g('fpickbg').classList.remove('open');\n"
         "  loadTree();goPage(0);\n"
+        "}\n"
+        "async function browseAndIngestAtStartup(){\n"
+        "  var picked=await nativeBrowseFolder();\n"
+        "  if(!picked)return;\n"
+        "  var r=await api('/ingest','POST',{folder:picked,mirror:true,force:true,recursive:true});\n"
+        "  if(r.error){toast(r.error,'err');return;}\n"
+        "  skipFolderPicker();\n"
+        "  pollIngest();\n"
         "}\n"
         "function newFolder(pid){\n"
         "  showDlg('New folder','Enter a name for the new folder.','','',\n"
@@ -1956,13 +2330,14 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "function rescanIngest(){\n"
         "  showDlg('Rescan / Ingest folder',\n"
         "    'Scan a folder on disk and import new or changed media into the library.','','',\n"
-        "    '<input id=\"ing_path\" placeholder=\"Folder path, e.g. C:\\\\Users\\\\Desmond\\\\Desktop\\\\Apps\\\\Things\\\\Content\" '\n"
-        "    +'style=\"width:100%;margin-bottom:9px\" />'\n"
-        "    +'<label style=\"display:flex;align-items:center;gap:7px;font-size:12px;cursor:pointer;margin-bottom:5px\">'\n"
+        "    '<div class=\"browserow\"><input id=\"ing_path\" placeholder=\"Folder path, e.g. C:\\\\Users\\\\Desmond\\\\Desktop\\\\Apps\\\\Things\\\\Content\" />'\n"
+        "    +(isDesktopApp()?'<button type=\"button\" class=\"browsebtn\" onclick=\"browseIntoField(&quot;ing_path&quot;)\">Browse&#8230;</button>':'')\n"
+        "    +'</div>'\n"
+        "    +'<label class=\"chk\" style=\"margin-bottom:5px\">'\n"
         "    +'<input type=\"checkbox\" id=\"ing_mirror\" /> Mirror folder structure into virtual folders</label>'\n"
-        "    +'<label style=\"display:flex;align-items:center;gap:7px;font-size:12px;cursor:pointer;margin-bottom:5px\">'\n"
+        "    +'<label class=\"chk\" style=\"margin-bottom:5px\">'\n"
         "    +'<input type=\"checkbox\" id=\"ing_force\" /> Force re-scan files already in the library</label>'\n"
-        "    +'<label style=\"display:flex;align-items:center;gap:7px;font-size:12px;cursor:pointer\">'\n"
+        "    +'<label class=\"chk\">'\n"
         "    +'<input type=\"checkbox\" id=\"ing_norecursive\" /> This folder only (skip subfolders)</label>',\n"
         "    'Ingest',false,\n"
         "    async function(){\n"
@@ -1973,6 +2348,10 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "      if(r.error){toast(r.error,'err');return;}\n"
         "      pollIngest();\n"
         "    });\n"
+        "}\n"
+        "async function browseIntoField(fieldId){\n"
+        "  var picked=await nativeBrowseFolder();\n"
+        "  if(picked){var el=g(fieldId);if(el)el.value=picked;}\n"
         "}\n"
         "var ingPollTimer=null;\n"
         "function pollIngest(){\n"
@@ -2021,6 +2400,9 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
 
         "async function loadStats(){\n"
         "  var s=await api('/stats');\n"
+        "  var sn=g('sbstatn');if(sn)sn.textContent=s.total+' file'+(s.total!==1?'s':'');\n"
+        "  var s2=g('sbstat2');if(s2)s2.textContent=fmtSz(s.total_size)+' on disk';\n"
+        "  var db=g('qvdupbadge');if(db)db.textContent=s.dup_groups||0;\n"
         "  g('statpanel').innerHTML=\n"
         "    '<div class=\"srow\"><span>Total files</span><span>'+s.total+'</span></div>'\n"
         "    +'<div class=\"srow\"><span>Images</span><span>'+s.images+'</span></div>'\n"
@@ -2037,14 +2419,21 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  var data=await api('/settings');\n"
         "  renderSettings(data);\n"
         "}\n"
-        "var LB_COLORS=['rgba(0,0,0,.95)','#0c0e13','#111827','#1c2030','#241b2e','#ffffff'];\n"
+        "var ACCENT_PRESETS=[\n"
+        "  {name:'Default',ac:null,ac2:null},\n"
+        "  {name:'Green',ac:'#2f9e6b',ac2:'#4cbb87'},\n"
+        "  {name:'Purple',ac:'#8b5cf6',ac2:'#a78bfa'},\n"
+        "  {name:'Amber',ac:'#c2740f',ac2:'#e0952e'},\n"
+        "  {name:'Rose',ac:'#e0517a',ac2:'#ef7aa0'},\n"
+        "  {name:'Teal',ac:'#14a897',ac2:'#4cc9b8'}\n"
+        "];\n"
         "function renderSettings(data){\n"
         "  var s=data.settings||{};\n"
         "  var mf=data.managed_folders||[];\n"
         "  var devOn=s.device_management_enabled==='1';\n"
         "  var autoOn=s.auto_ingest_on_startup==='1';\n"
         "  var curTheme=document.documentElement.getAttribute('data-theme')==='light'?'light':'dark';\n"
-        "  var curLb=getComputedStyle(document.documentElement).getPropertyValue('--lbbg').trim();\n"
+        "  var curAcInline=document.documentElement.style.getPropertyValue('--ac').trim();\n"
         "  var html='';\n"
         "  html+='<div class=\"setsec\"><h4>Device Management</h4>'\n"
         "    +'<label class=\"swrow\"><input type=\"checkbox\" id=\"setDevMgmt\"'+(devOn?' checked':'')\n"
@@ -2065,21 +2454,30 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  } else {\n"
         "    html+='<div class=\"mfempty\">No folders ingested yet.</div>';\n"
         "  }\n"
+        "  html+='<h4 class=\"danger\" style=\"margin-top:16px\">Danger Zone</h4>'\n"
+        "    +'<div class=\"sethint\">Permanently deletes every file AnimDB imported from these '\n"
+        "    +'folders (not the files on disk themselves) and resets the managed-folders list.</div>'\n"
+        "    +'<button class=\"fbtn danger\" onclick=\"resetManagedFoldersFlow()\">Reset Managed Folders&#8230;</button>';\n"
         "  html+='</div>';\n"
         "  html+='<div class=\"setsec\"><h4>Appearance</h4><div class=\"themerow\">'\n"
         "    +'<button class=\"vbtn'+(curTheme==='dark'?' on':'')+'\" onclick=\"setTheme(\\'dark\\')\">Dark</button>'\n"
         "    +'<button class=\"vbtn'+(curTheme==='light'?' on':'')+'\" onclick=\"setTheme(\\'light\\')\">Light</button>'\n"
         "    +'</div></div>';\n"
-        "  html+='<div class=\"setsec\"><h4>Lightbox Background</h4><div class=\"lbswatches\">'\n"
-        "    +LB_COLORS.map(function(c){\n"
-        "      var on=curLb===c?' on':'';\n"
-        "      return '<button class=\"lbswatch'+on+'\" style=\"background:'+c+'\" "
-        "onclick=\"setLbColor(\\''+c+'\\')\" title=\"'+c+'\"></button>';\n"
+        "  html+='<div class=\"setsec\"><h4>Accent Color</h4><div class=\"accswatches\">'\n"
+        "    +ACCENT_PRESETS.map(function(p){\n"
+        "      var on=(curAcInline===(p.ac||''))?' on':'';\n"
+        "      var bg=p.ac||'#5b8af0';\n"
+        "      var handler=p.ac?(\"setAccent('\"+p.ac+\"','\"+p.ac2+\"')\"):'resetAccent()';\n"
+        "      return '<button class=\"accswatch'+on+'\" style=\"background:'+bg+'\" "
+        "onclick=\"'+handler+'\" title=\"'+esc(p.name)+'\"></button>';\n"
         "    }).join('')\n"
-        "    +'<input type=\"color\" id=\"lbcustom\" onchange=\"setLbColor(this.value)\" title=\"Custom color\" '\n"
+        "    +'<input type=\"color\" id=\"acccustom\" value=\"'+(curAcInline||'#5b8af0')+'\" "
+        "onchange=\"setAccentCustom(this.value)\" title=\"Custom color\" '\n"
         "    +'style=\"width:24px;height:24px;padding:0;border:2px solid var(--bd);border-radius:50%;"
         "cursor:pointer;background:none\" />';\n"
         "  html+='</div></div>';\n"
+        "  html+='<div class=\"sethint\" style=\"text-align:center;margin-top:18px\">AnimDB '"
+        "+esc(data.version||'')+'</div>';\n"
         "  g('settingspanel').innerHTML=html;\n"
         "}\n"
         "async function toggleDevMgmt(on){\n"
@@ -2110,10 +2508,51 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  try{localStorage.setItem('animdb_theme',t);}catch(e){}\n"
         "  loadSettings();\n"
         "}\n"
-        "function setLbColor(c){\n"
-        "  document.documentElement.style.setProperty('--lbbg',c);\n"
-        "  try{localStorage.setItem('animdb_lbbg',c);}catch(e){}\n"
+        "function setAccent(ac,ac2){\n"
+        "  document.documentElement.style.setProperty('--ac',ac);\n"
+        "  document.documentElement.style.setProperty('--ac2',ac2);\n"
+        "  try{localStorage.setItem('animdb_ac',ac);localStorage.setItem('animdb_ac2',ac2);}catch(e){}\n"
         "  loadSettings();\n"
+        "}\n"
+        "function resetAccent(){\n"
+        "  document.documentElement.style.removeProperty('--ac');\n"
+        "  document.documentElement.style.removeProperty('--ac2');\n"
+        "  try{localStorage.removeItem('animdb_ac');localStorage.removeItem('animdb_ac2');}catch(e){}\n"
+        "  loadSettings();\n"
+        "}\n"
+        "function lightenColor(hex,amt){\n"
+        "  hex=hex.replace('#','');\n"
+        "  if(hex.length===3)hex=hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2];\n"
+        "  var r=parseInt(hex.substring(0,2),16),g=parseInt(hex.substring(2,4),16),b=parseInt(hex.substring(4,6),16);\n"
+        "  r=Math.round(r+(255-r)*amt);g=Math.round(g+(255-g)*amt);b=Math.round(b+(255-b)*amt);\n"
+        "  var h=function(n){var s=n.toString(16);return s.length===1?'0'+s:s;};\n"
+        "  return '#'+h(r)+h(g)+h(b);\n"
+        "}\n"
+        "function setAccentCustom(hex){\n"
+        "  setAccent(hex,lightenColor(hex,0.28));\n"
+        "}\n"
+        "function resetManagedFoldersFlow(){\n"
+        "  api('/managed_folders/reset_preview').then(function(p){\n"
+        "    if(!p.folders){\n"
+        "      showDlg('Reset managed folders',\n"
+        "        'There are no managed folders to reset right now \\u2014 nothing has been ingested yet.',\n"
+        "        '','','','OK',false,function(){});\n"
+        "      return;\n"
+        "    }\n"
+        "    showDlg('Reset managed folders',\n"
+        "      'This permanently deletes '+p.media+' file'+(p.media!==1?'s':'')+' from your AnimDB '\n"
+        "      +'library (across '+p.folders+' folder'+(p.folders!==1?'s':'')+') and clears the '\n"
+        "      +'managed-folders list. Files on disk are not touched, but AnimDB will need to '\n"
+        "      +'re-ingest these folders from scratch. This cannot be undone.',\n"
+        "      '','','','Reset Everything',true,\n"
+        "      async function(){\n"
+        "        var r=await api('/managed_folders/reset','POST',{});\n"
+        "        if(r.error){toast(r.error,'err');return;}\n"
+        "        toast('Reset '+r.media+' file'+(r.media!==1?'s':'')+' from '+r.folders\n"
+        "          +' folder'+(r.folders!==1?'s':''),'ok');\n"
+        "        loadSettings();loadMedia();loadStats();loadTree();loadTags();\n"
+        "      });\n"
+        "  });\n"
         "}\n"
 
         "async function openDupes(){\n"
@@ -2125,6 +2564,7 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "  var data=await api('/duplicates');\n"
         "  var groups=data.groups||[];\n"
         "  window._dupGroups=groups;\n"
+        "  g('dupdelallbtn').style.display=groups.length?'':'none';\n"
         "  if(!groups.length){\n"
         "    g('dupbody').innerHTML='<div class=\"empty\"><div class=\"eico\">&#10003;</div>"
         "<p>No duplicates found.</p></div>';\n"
@@ -2169,6 +2609,31 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
         "      var r=await api('/disk/delete','POST',{media_id:mid,permanent:false});\n"
         "      if(r.error){toast(r.error,'err');return;}\n"
         "      toast('Sent to Recycle Bin','ok');\n"
+        "      loadDupes();loadMedia();loadStats();\n"
+        "    });\n"
+        "}\n"
+        "function deleteAllDuplicates(){\n"
+        "  var groups=window._dupGroups||[];\n"
+        "  if(!groups.length)return;\n"
+        "  var toDelete=[];\n"
+        "  groups.forEach(function(grp){\n"
+        "    var items=grp.items.slice();\n"
+        "    var keep=items.reduce(function(a,b){return (b.file_size||0)>(a.file_size||0)?b:a;});\n"
+        "    items.forEach(function(it){if(it.id!==keep.id)toDelete.push(it.id);});\n"
+        "  });\n"
+        "  showDlg('Delete all duplicates',\n"
+        "    'Across '+groups.length+' duplicate group'+(groups.length!==1?'s':'')\n"
+        "    +', '+toDelete.length+' file'+(toDelete.length!==1?'s':'')\n"
+        "    +' will be sent to the Recycle Bin. The largest copy in each group is kept.','','','',\n"
+        "    'Delete '+toDelete.length+' Files',true,\n"
+        "    async function(){\n"
+        "      var ok=0,fail=0;\n"
+        "      for(var mid of toDelete){\n"
+        "        var r=await api('/disk/delete','POST',{media_id:mid,permanent:false});\n"
+        "        r.ok?ok++:fail++;\n"
+        "      }\n"
+        "      toast('Removed '+ok+' duplicate file'+(ok!==1?'s':'')+(fail?', '+fail+' failed':''),\n"
+        "        fail?'err':'ok');\n"
         "      loadDupes();loadMedia();loadStats();\n"
         "    });\n"
         "}\n"
@@ -2259,10 +2724,9 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
 
         "g('q').addEventListener('input',dbt(function(){goPage(0);}));\n"
         "(async function(){var s=await api('/ingest_status');if(s.running)pollIngest();})();\n"
-        "try{var _lb=localStorage.getItem('animdb_lbbg');"
-        "if(_lb)document.documentElement.style.setProperty('--lbbg',_lb);}catch(e){}\n"
         "restoreUIState();\n"
         "loadTree();\n"
+        "loadStats();\n"
         "showFolderPicker();\n"
         "</script>\n"
         "</body>\n"
@@ -2441,7 +2905,12 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
                 self.send_json({
                     "settings": get_all_settings(conn),
                     "managed_folders": get_managed_folders(conn),
+                    "version": VERSION,
                 })
+                return
+
+            if ap == "/managed_folders/reset_preview":
+                self.send_json(reset_managed_folders_preview(conn))
                 return
 
             if ap == "/tags":
@@ -2582,6 +3051,14 @@ def _build_server(db_path, host="127.0.0.1", port=DEFAULT_PORT):
             if p == "/api/managed_folders/clear":
                 clear_managed_folders(conn)
                 self.send_json({"ok": True, "managed_folders": get_managed_folders(conn)})
+                return
+
+            if p == "/api/managed_folders/reset":
+                try:
+                    result = reset_managed_folders(conn)
+                    self.send_json({"ok": True, **result})
+                except DeviceManagementDisabledError as e:
+                    self.send_json({"error": str(e)}, 403)
                 return
 
             if p == "/api/ingest":
@@ -2731,10 +3208,27 @@ def run_desktop_app(db_path, host="127.0.0.1", port=DEFAULT_PORT):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
+    class DesktopApi:
+        """Exposed to the page as window.pywebview.api.* - lets the embedded
+        HTML/JS trigger a real native OS folder-picker dialog, which a plain
+        browser tab can never do. Only wired up in `app` mode (see run_ui for
+        the browser-tab entry point, which has no js_api and so the frontend's
+        isDesktopApp() feature-detection correctly falls back to manual path
+        entry there)."""
+        def browse_folder(self):
+            try:
+                result = window.create_file_dialog(webview.FOLDER_DIALOG)
+            except Exception:
+                return None
+            if result:
+                return result[0]
+            return None
+
     window = webview.create_window(
         "AnimDB",
         f"http://{host}:{port}",
         width=1360, height=860, min_size=(900, 600),
+        js_api=DesktopApi(),
     )
 
     def _on_closed():
@@ -2758,6 +3252,7 @@ def main():
     ap = argparse.ArgumentParser(
         prog="animdb",
         description="AnimDB")
+    ap.add_argument("--version", action="version", version=f"AnimDB {VERSION}")
     ap.add_argument("--db", default=None,
                     help=f"Database file (default: {DEFAULT_DB}, next to this "
                          f"script/exe - not the current directory)")
